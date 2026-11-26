@@ -5,15 +5,34 @@
 // réutilisable par server.js et par les tests.
 // ════════════════════════════════════════════════════════════
 
+const path = require('path')
 const express = require('express')
 const cors = require('cors')
 const config = require('./config')
 const supabase = require('./supabase')
 const { routeIntrouvable, gestionnaireErreurs } = require('./middlewares/erreurs')
 const { enTetesSecurite, optionsCors, assainirReponses } = require('./middlewares/securite')
+const { tracage } = require('./middlewares/tracage')
 const { creerMiddlewareWAF } = require('./algorithms/algo13_detectionWAF')
 
 const DELAI_VERIFICATION_BASE_MS = 3000
+const CHEMIN_SPEC_OPENAPI = path.join(__dirname, '..', 'docs', 'openapi.yaml')
+
+// Montage des routeurs métier (réutilisé par le test de cohérence OpenAPI).
+const MONTAGES = Object.freeze([
+  ['/api/auth', './routes/auth'],
+  ['/api/users', './routes/users'],
+  ['/api/forwarding', './routes/forwarding'],
+  ['/api/mirror', './routes/mirror'],
+  ['/api/prediction', './routes/prediction'],
+  ['/api/stock', './routes/stock'],
+  ['/api/esim', './routes/esim'],
+  ['/api/geolocalisation', './routes/geolocalisation'],
+  ['/api/security', './routes/security'],
+  ['/api/currency', './routes/currency'],
+  ['/api/declarations', './routes/declarations']
+])
+const ALIAS = Object.freeze([['/api/geolocation', './routes/geolocalisation']]) // alias documenté dans le contrôleur
 
 const verifierBase = async () => {
   const requete = supabase.from('country').select('country_iso', { head: true, count: 'exact' }).limit(1)
@@ -30,6 +49,9 @@ const verifierBase = async () => {
 
 const creerApp = () => {
   const app = express()
+
+  // Identifiant de requête et journal d'accès, avant tout le reste.
+  app.use(tracage)
 
   // Derrière un reverse proxy, req.ip doit refléter l'IP réelle du client.
   app.set('trust proxy', config.trustProxy)
@@ -68,21 +90,15 @@ const creerApp = () => {
     })
   })
 
-  // ── Routes métier ────────────────────────────────────────
-  const routesGeolocalisation = require('./routes/geolocalisation')
+  // Spécification OpenAPI (hors production) : docs/openapi.yaml.
+  if (!config.estProduction) {
+    app.get('/api/docs/openapi.yaml', (req, res) => {
+      res.type('application/yaml').sendFile(CHEMIN_SPEC_OPENAPI)
+    })
+  }
 
-  app.use('/api/auth', require('./routes/auth'))
-  app.use('/api/users', require('./routes/users'))
-  app.use('/api/forwarding', require('./routes/forwarding'))
-  app.use('/api/mirror', require('./routes/mirror'))
-  app.use('/api/prediction', require('./routes/prediction'))
-  app.use('/api/stock', require('./routes/stock'))
-  app.use('/api/esim', require('./routes/esim'))
-  app.use('/api/geolocalisation', routesGeolocalisation)
-  app.use('/api/geolocation', routesGeolocalisation) // alias documenté dans le contrôleur
-  app.use('/api/security', require('./routes/security'))
-  app.use('/api/currency', require('./routes/currency'))
-  app.use('/api/declarations', require('./routes/declarations'))
+  // ── Routes métier ────────────────────────────────────────
+  for (const [prefixe, module] of [...MONTAGES, ...ALIAS]) app.use(prefixe, require(module))
 
   app.use(routeIntrouvable)
   app.use(gestionnaireErreurs)
@@ -90,4 +106,4 @@ const creerApp = () => {
   return app
 }
 
-module.exports = { creerApp }
+module.exports = { creerApp, MONTAGES }

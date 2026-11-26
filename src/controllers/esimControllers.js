@@ -4,9 +4,18 @@ const supabase = require('../supabase')
 const v = require('../utils/validation')
 const { HttpError, introuvable, requeteInvalide, indisponible } = require('../utils/http')
 const { donnees, paginer } = require('../utils/db')
-const { selectionReseauEsim, PLAN_DEFAUT, QUOTA_DATA_MO } = require('../algorithms/algo05_selectionReseauESIM')
+const { executerEnExclusion } = require('../utils/exclusion')
+const {
+  selectionReseauEsim,
+  calculerExpirationForfait,
+  PLAN_DEFAUT,
+  QUOTA_DATA_MO
+} = require('../algorithms/algo05_selectionReseauESIM')
 
 const PLANS = Object.keys(QUOTA_DATA_MO)
+
+// Échéance calculée du forfait (null pour BYOE).
+const avecEcheance = (esim) => (esim ? { ...esim, expire_le: calculerExpirationForfait(esim) } : esim)
 
 // ════════════════════════════════════════════
 // POST /api/esim/provision
@@ -28,20 +37,25 @@ const provisionnerESIM = async (req, res) => {
     throw requeteInvalide('Le pays de l\'eSIM doit être celui du numéro virtuel', { paysNumero: numero.country_iso })
   }
 
+  // Une demande à la fois par numéro : deux appels simultanés ne créent pas deux eSIM.
+  return executerEnExclusion(`esim:${userId}:${numberId}`, () => provisionnerSansConcurrence(res, { userId, numberId, paysISO, plan }))
+}
+
+const provisionnerSansConcurrence = async (res, { userId, numberId, paysISO, plan }) => {
   // Une seule eSIM active par numéro : la demande répétée renvoie l'existante.
   const existantes = donnees(
     await supabase.from('esim_profile').select('*').eq('user_id', userId).eq('number_id', numberId).eq('status', 'ACTIVE').limit(1),
     'recherche d\'une eSIM active'
   ) || []
   if (existantes.length > 0) {
-    return res.status(200).json({ message: 'Une eSIM active existe déjà pour ce numéro', esim: existantes[0] })
+    return res.status(200).json({ message: 'Une eSIM active existe déjà pour ce numéro', esim: avecEcheance(existantes[0]) })
   }
 
   const resultat = await selectionReseauEsim({ userId, numberId, paysISO, plan })
 
   switch (resultat.statut) {
     case 'SUCCES':
-      return res.status(201).json({ message: 'eSIM provisionnée avec succès', esim: resultat.esim, partenaire: resultat.partenaire, plan })
+      return res.status(201).json({ message: 'eSIM provisionnée avec succès', esim: avecEcheance(resultat.esim), partenaire: resultat.partenaire, plan })
     case 'BYOE':
       return res.status(201).json({ message: 'Mode BYOE : votre propre eSIM sera utilisée', esim: resultat.esim })
     case 'ROAMING_GRATUIT':
@@ -59,12 +73,16 @@ const provisionnerESIM = async (req, res) => {
 const getESIM = async (req, res) => {
   const page = v.pagination(req.query)
   const { lignes, total } = await paginer(
-    supabase.from('esim_profile').select('*', { count: 'exact' }).eq('user_id', req.params.userId).order('created_at', { ascending: false }),
+    supabase
+      .from('esim_profile')
+      .select('*', { count: 'exact' })
+      .eq('user_id', req.params.userId)
+      .order('activated_at', { ascending: false, nullsFirst: false }),
     page,
     'lecture des eSIM'
   )
 
-  return res.status(200).json({ esims: lignes, total, ...page })
+  return res.status(200).json({ esims: lignes.map(avecEcheance), total, ...page })
 }
 
 module.exports = { provisionnerESIM, getESIM }

@@ -114,6 +114,21 @@ describe('algo10 — jetons Zero Trust', () => {
     assert.throws(() => a10.verifierToken(t2.access_token), (e) => e.details.code === 'TOKENS_REVOQUES')
   })
 
+  test('jeton sensible : 5 minutes, marqué, révoqué avec sa session', async () => {
+    const tokens = await a10.genererTokens({ userId: U, role: 'USER', deviceId: 'iphone', appareilConnu: true })
+    const session = a10.verifierToken(tokens.access_token)
+    assert.equal(session.sensible, false)
+    assert.equal(session.appareilConnu, true)
+
+    const sensible = a10.genererJetonSensible({ ...session })
+    assert.equal(sensible.expires_in, 5 * 60)
+    const auth = a10.verifierToken(sensible.access_token)
+    assert.deepEqual([auth.sensible, auth.sessionId, auth.appareilConnu], [true, session.sessionId, true])
+
+    await a10.revoquerSession({ sessionId: session.sessionId })
+    assert.throws(() => a10.verifierToken(sensible.access_token), (e) => e.details.code === 'SESSION_REVOQUEE')
+  })
+
   test('rôle : liste ADMIN_USER_IDS ou colonne role', () => {
     assert.equal(a10.determinerRole({ user_id: 'a0000000-0000-4000-8000-0000000000ad' }), 'ADMIN')
     assert.equal(a10.determinerRole({ user_id: U, role: 'admin' }), 'ADMIN')

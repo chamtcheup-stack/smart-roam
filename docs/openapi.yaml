@@ -1,0 +1,862 @@
+openapi: 3.1.0
+info:
+  title: Smart Roam — API backend
+  version: 1.0.0
+  description: |
+    Numéros virtuels par pays, activation à l'arrivée, renvoi d'appels, eSIM,
+    conversion de devises et profil miroir.
+
+    - Authentification : `Authorization: Bearer <access_token>` (POST /api/auth/login),
+      ou `x-api-key` pour les appels machine-à-machine (rôle SERVICE).
+    - Un utilisateur n'agit que sur ses propres données (`userId` déduit du jeton) ;
+      ADMIN et SERVICE peuvent cibler n'importe quel compte.
+    - Opérations sensibles (conversion, suppression du compte) : jeton sensible
+      obtenu par POST /api/security/pin/verify (5 minutes).
+    - Erreurs : `{ "erreur": "…", …détails }`. Les erreurs 500 portent une
+      `reference` égale à l'en-tête `X-Request-Id`.
+    - Listes paginées : `?limit=` (1–200, défaut 50) et `?offset=`.
+servers:
+  - url: http://localhost:3000
+security:
+  - bearerAuth: []
+tags:
+  - name: Supervision
+  - name: Authentification
+  - name: Utilisateurs
+  - name: Sécurité
+  - name: Déclarations
+  - name: Géolocalisation
+  - name: Forwarding
+  - name: eSIM
+  - name: Change
+  - name: Miroir
+  - name: Prédiction
+  - name: Stock
+
+paths:
+  /:
+    get:
+      tags: [Supervision]
+      summary: Message de bienvenue
+      security: []
+      responses:
+        '200': { description: Serveur opérationnel }
+  /api/health:
+    get:
+      tags: [Supervision]
+      summary: Liveness (le processus répond)
+      security: []
+      responses:
+        '200': { description: OK }
+  /api/ready:
+    get:
+      tags: [Supervision]
+      summary: Readiness (la base répond)
+      security: []
+      responses:
+        '200': { description: Base joignable }
+        '503': { description: Base injoignable }
+  /api/docs/openapi.yaml:
+    get:
+      tags: [Supervision]
+      summary: Cette spécification (hors production)
+      security: []
+      responses:
+        '200': { description: Spécification OpenAPI }
+
+  /api/auth/login:
+    post:
+      tags: [Authentification]
+      summary: Connexion par numéro de téléphone et PIN
+      description: |
+        Verrou progressif par compte (5 échecs → 15 min, puis 1 h, 4 h, 24 h),
+        partagé avec la vérification du PIN. Seuls les échecs sont comptés par IP.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [phoneNumber, pin]
+              properties:
+                phoneNumber: { type: string, example: '+237699123456' }
+                pin: { type: string, pattern: '^\d{4}$' }
+                deviceId: { type: string, maxLength: 128, description: Identifiant stable de l'appareil (anti-fraude) }
+      responses:
+        '200':
+          description: Connexion réussie
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: { type: string }
+                  user: { $ref: '#/components/schemas/UtilisateurResume' }
+                  tokens: { $ref: '#/components/schemas/Jetons' }
+        '400': { $ref: '#/components/responses/RequeteInvalide' }
+        '401': { $ref: '#/components/responses/NonAuthentifie' }
+        '429': { $ref: '#/components/responses/TropDeRequetes' }
+  /api/auth/refresh:
+    post:
+      tags: [Authentification]
+      summary: Renouveler les jetons (refresh token à usage unique)
+      description: La réutilisation d'un refresh token déjà consommé révoque toutes les sessions.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refreshToken]
+              properties:
+                refreshToken: { type: string }
+      responses:
+        '200':
+          description: Nouveaux jetons
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tokens: { $ref: '#/components/schemas/Jetons' }
+        '401': { $ref: '#/components/responses/NonAuthentifie' }
+  /api/auth/logout:
+    post:
+      tags: [Authentification]
+      summary: Fermer la session courante
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                refreshToken: { type: string }
+      responses:
+        '200': { description: Déconnexion effectuée }
+        '401': { $ref: '#/components/responses/NonAuthentifie' }
+  /api/auth/logout-all:
+    post:
+      tags: [Authentification]
+      summary: Fermer toutes les sessions du compte
+      responses:
+        '200': { description: Sessions fermées }
+        '401': { $ref: '#/components/responses/NonAuthentifie' }
+
+  /api/users/register:
+    post:
+      tags: [Utilisateurs]
+      summary: Inscription (renvoie des jetons pour créer le premier PIN)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Inscription' }
+      responses:
+        '201':
+          description: Utilisateur créé
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user: { $ref: '#/components/schemas/UtilisateurResume' }
+                  tokens: { $ref: '#/components/schemas/Jetons' }
+        '400': { $ref: '#/components/responses/RequeteInvalide' }
+        '409': { $ref: '#/components/responses/Conflit' }
+        '429': { $ref: '#/components/responses/TropDeRequetes' }
+  /api/users:
+    post:
+      tags: [Utilisateurs]
+      summary: Inscription (ancienne route, identique à /api/users/register)
+      deprecated: true
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Inscription' }
+      responses:
+        '201': { description: Utilisateur créé }
+  /api/users/{userId}:
+    parameters:
+      - $ref: '#/components/parameters/UserIdChemin'
+    get:
+      tags: [Utilisateurs]
+      summary: Profil (liste blanche de champs)
+      responses:
+        '200': { description: Profil }
+        '403': { $ref: '#/components/responses/Interdit' }
+        '404': { $ref: '#/components/responses/Introuvable' }
+    delete:
+      tags: [Utilisateurs]
+      summary: Supprimer le compte (suppression logique)
+      description: Jeton sensible exigé ; numéros mis en parking, sessions révoquées.
+      security:
+        - jetonSensible: []
+      responses:
+        '200': { description: Compte supprimé }
+        '401': { $ref: '#/components/responses/NonAuthentifie' }
+        '404': { $ref: '#/components/responses/Introuvable' }
+  /api/users/{userId}/numbers:
+    get:
+      tags: [Utilisateurs]
+      summary: Numéros virtuels du compte
+      parameters:
+        - $ref: '#/components/parameters/UserIdChemin'
+        - $ref: '#/components/parameters/Limite'
+        - $ref: '#/components/parameters/Decalage'
+      responses:
+        '200': { description: Page de numéros }
+  /api/users/{userId}/kyc:
+    put:
+      tags: [Utilisateurs]
+      summary: Mettre à jour le statut KYC (ADMIN / SERVICE)
+      security:
+        - bearerAuth: []
+        - cleService: []
+      parameters:
+        - $ref: '#/components/parameters/UserIdChemin'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [kycStatus]
+              properties:
+                kycStatus: { type: string, enum: [PENDING, VERIFIED, REJECTED] }
+      responses:
+        '200': { description: Statut mis à jour }
+        '403': { $ref: '#/components/responses/Interdit' }
+        '404': { $ref: '#/components/responses/Introuvable' }
+
+  /api/security/pin/create:
+    post:
+      tags: [Sécurité]
+      summary: Créer le premier PIN, ou le changer (ancienPin obligatoire)
+      description: Un PIN modifié révoque toutes les sessions. ADMIN / SERVICE peuvent le réinitialiser.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pin]
+              properties:
+                userId: { type: string }
+                pin: { type: string, pattern: '^\d{4}$' }
+                ancienPin: { type: string, pattern: '^\d{4}$' }
+      responses:
+        '200': { description: PIN créé ou modifié }
+        '400': { $ref: '#/components/responses/RequeteInvalide' }
+        '403': { $ref: '#/components/responses/Interdit' }
+        '429': { $ref: '#/components/responses/TropDeRequetes' }
+  /api/security/pin/verify:
+    post:
+      tags: [Sécurité]
+      summary: Vérifier le PIN et obtenir un jeton sensible (5 min)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pin]
+              properties:
+                userId: { type: string }
+                pin: { type: string, pattern: '^\d{4}$' }
+      responses:
+        '200':
+          description: Résultat de la vérification
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  valide: { type: boolean }
+                  tentativesRestantes: { type: integer }
+                  jetonSensible: { $ref: '#/components/schemas/JetonSensible' }
+        '429': { $ref: '#/components/responses/TropDeRequetes' }
+  /api/security/pin/unlock:
+    post:
+      tags: [Sécurité]
+      summary: Lever le verrouillage anti-force brute d'un compte (ADMIN / SERVICE)
+      security:
+        - bearerAuth: []
+        - cleService: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [userId]
+              properties:
+                userId: { type: string }
+      responses:
+        '200': { description: Compte déverrouillé }
+        '403': { $ref: '#/components/responses/Interdit' }
+        '404': { $ref: '#/components/responses/Introuvable' }
+  /api/security/waf/analyze:
+    post:
+      tags: [Sécurité]
+      summary: Simulation du pare-feu applicatif sur une charge utile (ADMIN / SERVICE)
+      security:
+        - bearerAuth: []
+        - cleService: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                ip: { type: string }
+                url: { type: string }
+                payload: { oneOf: [{ type: string }, { type: object }] }
+      responses:
+        '200': { description: 'Décision ALLOW, BLOCK ou CAPTCHA' }
+
+  /api/declarations/new:
+    post:
+      tags: [Déclarations]
+      summary: Déclarer un voyage (attribue le numéro virtuel du pays)
+      parameters:
+        - $ref: '#/components/parameters/CleIdempotence'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [paysISO, dateDepart]
+              properties:
+                userId: { type: string }
+                paysISO: { type: string, example: FR }
+                dateDepart: { type: string, format: date }
+                dateRetour: { type: string, format: date }
+      responses:
+        '201': { description: Déclaration créée }
+        '200': { description: Déclaration déjà active pour ce pays }
+        '400': { $ref: '#/components/responses/RequeteInvalide' }
+        '409': { $ref: '#/components/responses/Conflit' }
+        '503': { $ref: '#/components/responses/Indisponible' }
+  /api/declarations/{userId}:
+    get:
+      tags: [Déclarations]
+      summary: Déclarations du compte
+      parameters:
+        - $ref: '#/components/parameters/UserIdChemin'
+        - $ref: '#/components/parameters/Limite'
+        - $ref: '#/components/parameters/Decalage'
+      responses:
+        '200': { description: Page de déclarations }
+  /api/declarations/{declarationId}/cancel:
+    put:
+      tags: [Déclarations]
+      summary: Annuler une déclaration (numéro mis en parking)
+      parameters:
+        - { name: declarationId, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: Déclaration annulée (ou déjà annulée) }
+        '400': { $ref: '#/components/responses/RequeteInvalide' }
+        '404': { $ref: '#/components/responses/Introuvable' }
+
+  /api/geolocalisation/arrivee:
+    post:
+      tags: [Géolocalisation]
+      summary: Détection d'arrivée ou de retour à partir des signaux du téléphone
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                mcc: { type: string, example: '208' }
+                mnc: { type: string, example: '01' }
+                ssid: { type: string }
+                cellId: { type: string }
+                cellIdConfirmation: { type: string }
+                paysIP: { type: string, example: FR }
+      responses:
+        '200': { description: 'Décision : ARRIVEE_CONFIRMEE, RETOUR_DETECTE, ATTENTE_SIGNAL_SUPPLEMENTAIRE…' }
+        '400': { $ref: '#/components/responses/RequeteInvalide' }
+  /api/geolocalisation/ssid:
+    post:
+      tags: [Géolocalisation]
+      summary: Reconnaître un Wi-Fi d'aéroport (alias /api/geolocation/ssid)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ssid]
+              properties:
+                ssid: { type: string, maxLength: 64 }
+      responses:
+        '200': { description: Résultat de la reconnaissance }
+  /api/geolocalisation/mccmnc:
+    post:
+      tags: [Géolocalisation]
+      summary: Décoder un code pays/opérateur mobile
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [mcc]
+              properties:
+                mcc: { type: string, pattern: '^\d{3}$' }
+                mnc: { type: string, pattern: '^\d{1,3}$' }
+      responses:
+        '200': { description: 'Pays, opérateur et confiance' }
+        '400': { $ref: '#/components/responses/RequeteInvalide' }
+  /api/geolocalisation/cellid:
+    post:
+      tags: [Géolocalisation]
+      summary: Signaler l'antenne relais courante (changement de Cell-ID)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [cellId]
+              properties:
+                cellId: { type: string }
+                cellIdConfirmation: { type: string }
+      responses:
+        '200': { description: Changement détecté ou non }
+
+  /api/forwarding/rules/create:
+    post:
+      tags: [Forwarding]
+      summary: Créer une règle de renvoi d'appel
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [numberId, triggerCondition, action]
+              properties:
+                userId: { type: string }
+                numberId: { type: string }
+                triggerCondition: { type: string, enum: [ALWAYS, BUSY, NO_ANSWER, NEVER] }
+                action: { type: string, enum: [FORWARD, VOICEMAIL, REJECT, RING] }
+                targetNumber: { type: string, description: Obligatoire pour FORWARD }
+                priority: { type: integer, minimum: 0, maximum: 1000 }
+      responses:
+        '201': { description: Règle créée }
+        '400': { $ref: '#/components/responses/RequeteInvalide' }
+        '404': { $ref: '#/components/responses/Introuvable' }
+  /api/forwarding/rules/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: userId pour GET, ruleId pour PUT et DELETE
+        schema: { type: string }
+    get:
+      tags: [Forwarding]
+      summary: Règles d'un compte (id = userId)
+      parameters:
+        - $ref: '#/components/parameters/Limite'
+        - $ref: '#/components/parameters/Decalage'
+      responses:
+        '200': { description: Page de règles }
+    put:
+      tags: [Forwarding]
+      summary: Modifier une règle (id = ruleId)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                triggerCondition: { type: string, enum: [ALWAYS, BUSY, NO_ANSWER, NEVER] }
+                action: { type: string, enum: [FORWARD, VOICEMAIL, REJECT, RING] }
+                targetNumber: { type: [string, 'null'] }
+                priority: { type: integer, minimum: 0, maximum: 1000 }
+                isActive: { type: boolean }
+      responses:
+        '200': { description: Règle mise à jour }
+        '400': { $ref: '#/components/responses/RequeteInvalide' }
+        '404': { $ref: '#/components/responses/Introuvable' }
+    delete:
+      tags: [Forwarding]
+      summary: Désactiver une règle (id = ruleId)
+      responses:
+        '200': { description: Règle désactivée }
+        '404': { $ref: '#/components/responses/Introuvable' }
+  /api/forwarding/evaluate:
+    post:
+      tags: [Forwarding]
+      summary: Décision de routage d'un appel entrant (SERVICE / ADMIN)
+      security:
+        - cleService: []
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [numeroAppele, numeroAppelant]
+              properties:
+                numeroAppele: { type: string }
+                numeroAppelant: { type: string, description: Peut être « anonymous » }
+                statutLigne: { type: string, enum: [LIBRE, OCCUPE, SANS_REPONSE, BUSY, NO_ANSWER] }
+      responses:
+        '200': { description: 'Décision, destination et code SIP (302 / 486)' }
+        '404': { description: Numéro inconnu ou inactif (décision REJECT) }
+
+  /api/esim/provision:
+    post:
+      tags: [eSIM]
+      summary: Provisionner l'eSIM du pays du numéro virtuel
+      parameters:
+        - $ref: '#/components/parameters/CleIdempotence'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [numberId, paysISO]
+              properties:
+                userId: { type: string }
+                numberId: { type: string }
+                paysISO: { type: string }
+                plan: { type: string, enum: [DAY, WEEK, MONTH] }
+      responses:
+        '201': { description: eSIM provisionnée (ou mode BYOE) }
+        '200': { description: 'eSIM déjà active, ou roaming UE gratuit' }
+        '400': { $ref: '#/components/responses/RequeteInvalide' }
+        '502': { description: Échec chez tous les partenaires }
+        '503': { $ref: '#/components/responses/Indisponible' }
+  /api/esim/{userId}:
+    get:
+      tags: [eSIM]
+      summary: eSIM du compte (avec échéance du forfait)
+      parameters:
+        - $ref: '#/components/parameters/UserIdChemin'
+        - $ref: '#/components/parameters/Limite'
+        - $ref: '#/components/parameters/Decalage'
+      responses:
+        '200': { description: Page d'eSIM }
+
+  /api/currency/corridors:
+    get:
+      tags: [Change]
+      summary: Corridors de change ouverts
+      responses:
+        '200': { description: Liste des corridors et disponibilité }
+  /api/currency/preview:
+    post:
+      tags: [Change]
+      summary: Devis de conversion (taux réel, commission 1,5 %)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DemandeConversion' }
+      responses:
+        '200': { description: Devis }
+        '400': { $ref: '#/components/responses/RequeteInvalide' }
+        '503': { $ref: '#/components/responses/Indisponible' }
+  /api/currency/confirm:
+    post:
+      tags: [Change]
+      summary: Confirmer une conversion (jeton sensible, contrôle anti-fraude)
+      security:
+        - jetonSensible: []
+      parameters:
+        - $ref: '#/components/parameters/CleIdempotence'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DemandeConversion' }
+      responses:
+        '201': { description: Transaction enregistrée }
+        '400': { $ref: '#/components/responses/RequeteInvalide' }
+        '401': { $ref: '#/components/responses/NonAuthentifie' }
+        '403': { description: Transaction bloquée par l'anti-fraude }
+        '422': { description: Clé d'idempotence réutilisée avec un autre corps }
+        '503': { $ref: '#/components/responses/Indisponible' }
+  /api/currency/history/{userId}:
+    get:
+      tags: [Change]
+      summary: Historique des transactions
+      parameters:
+        - $ref: '#/components/parameters/UserIdChemin'
+        - $ref: '#/components/parameters/Limite'
+        - $ref: '#/components/parameters/Decalage'
+      responses:
+        '200': { description: Page de transactions }
+
+  /api/mirror/sync:
+    post:
+      tags: [Miroir]
+      summary: Synchroniser le profil miroir d'un numéro
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [numberId]
+              properties:
+                userId: { type: string }
+                numberId: { type: string }
+      responses:
+        '200': { description: Profil miroir synchronisé }
+        '404': { $ref: '#/components/responses/Introuvable' }
+  /api/mirror/consent:
+    post:
+      tags: [Miroir]
+      summary: Accorder ou retirer un consentement de partage
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [paysDestination, dataType]
+              properties:
+                userId: { type: string }
+                paysDestination: { type: string }
+                dataType: { type: string, enum: [PROFILE, LOCATION, TRANSACTION, AVATAR] }
+                isGranted: { type: boolean, default: true }
+      responses:
+        '200': { description: Consentement enregistré }
+        '400': { $ref: '#/components/responses/RequeteInvalide' }
+  /api/mirror/{userId}:
+    get:
+      tags: [Miroir]
+      summary: Profils miroir du compte
+      parameters:
+        - $ref: '#/components/parameters/UserIdChemin'
+        - $ref: '#/components/parameters/Limite'
+        - $ref: '#/components/parameters/Decalage'
+      responses:
+        '200': { description: Page de profils }
+
+  /api/prediction/suggest:
+    post:
+      tags: [Prédiction]
+      summary: Destination suggérée d'après l'historique
+      responses:
+        '200': { description: Suggestion (ou raison de l'absence de suggestion) }
+  /api/prediction/feedback:
+    post:
+      tags: [Prédiction]
+      summary: Réponse de l'utilisateur à une suggestion
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [paysISO, acceptee]
+              properties:
+                userId: { type: string }
+                paysISO: { type: string }
+                acceptee: { type: boolean }
+      responses:
+        '200': { description: Réponse enregistrée }
+  /api/prediction/history/{userId}:
+    get:
+      tags: [Prédiction]
+      summary: Historique de voyages
+      parameters:
+        - $ref: '#/components/parameters/UserIdChemin'
+        - $ref: '#/components/parameters/Limite'
+        - $ref: '#/components/parameters/Decalage'
+      responses:
+        '200': { description: Page d'historique }
+
+  /api/stock/pools:
+    get:
+      tags: [Stock]
+      summary: État des pools de numéros (ADMIN / SERVICE)
+      security:
+        - bearerAuth: []
+        - cleService: []
+      parameters:
+        - $ref: '#/components/parameters/Limite'
+        - $ref: '#/components/parameters/Decalage'
+      responses:
+        '200': { description: Page de pools }
+  /api/stock/check:
+    post:
+      tags: [Stock]
+      summary: Analyse JIT des pools d'un pays (ADMIN / SERVICE)
+      security:
+        - bearerAuth: []
+        - cleService: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [paysISO]
+              properties:
+                paysISO: { type: string }
+      responses:
+        '200': { description: Rapport d'analyse }
+        '404': { $ref: '#/components/responses/Introuvable' }
+  /api/stock/reorder/{poolId}:
+    put:
+      tags: [Stock]
+      summary: Confirmer un réapprovisionnement (ADMIN / SERVICE)
+      security:
+        - bearerAuth: []
+        - cleService: []
+      parameters:
+        - { name: poolId, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [quantite]
+              properties:
+                quantite: { type: integer, minimum: 10000, maximum: 10000000 }
+      responses:
+        '200': { description: Réapprovisionnement confirmé }
+        '409': { $ref: '#/components/responses/Conflit' }
+  /api/stock/jit/run:
+    post:
+      tags: [Stock]
+      summary: Exécuter le JIT Stock Manager sur tous les pools (ADMIN / SERVICE)
+      security:
+        - bearerAuth: []
+        - cleService: []
+      responses:
+        '200': { description: Rapport d'analyse }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+    jetonSensible:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Jeton renvoyé par POST /api/security/pin/verify (champ jetonSensible), valable 5 minutes.
+    cleService:
+      type: apiKey
+      in: header
+      name: x-api-key
+  parameters:
+    UserIdChemin:
+      name: userId
+      in: path
+      required: true
+      schema: { type: string }
+    Limite:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+    Decalage:
+      name: offset
+      in: query
+      schema: { type: integer, minimum: 0, default: 0 }
+    CleIdempotence:
+      name: Idempotency-Key
+      in: header
+      description: Rejouer la même clé renvoie la réponse initiale (24 h).
+      schema: { type: string, minLength: 8, maxLength: 128 }
+  schemas:
+    Erreur:
+      type: object
+      required: [erreur]
+      properties:
+        erreur: { type: string }
+        reference: { type: string, description: Identifiant de requête (erreurs 500) }
+        code: { type: string }
+      additionalProperties: true
+    Jetons:
+      type: object
+      properties:
+        token_type: { type: string, example: Bearer }
+        access_token: { type: string }
+        expires_in: { type: integer, example: 900 }
+        refresh_token: { type: string }
+        refresh_expires_in: { type: integer, example: 604800 }
+    JetonSensible:
+      type: object
+      properties:
+        token_type: { type: string, example: Bearer }
+        access_token: { type: string }
+        expires_in: { type: integer, example: 300 }
+    UtilisateurResume:
+      type: object
+      properties:
+        user_id: { type: string }
+        phone_number: { type: string }
+        country_of_residence: { type: string }
+        kyc_status: { type: string }
+    Inscription:
+      type: object
+      required: [phoneNumber, countryResidence]
+      properties:
+        phoneNumber: { type: string, example: '+237699123456' }
+        countryResidence: { type: string, example: CM }
+        planId: { type: string }
+    DemandeConversion:
+      type: object
+      required: [deviseSource, deviseCible, montant]
+      properties:
+        userId: { type: string }
+        deviseSource: { type: string, example: XAF }
+        deviseCible: { type: string, example: EUR }
+        montant: { type: number, exclusiveMinimum: 0 }
+  responses:
+    RequeteInvalide:
+      description: Entrée invalide
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Erreur' }
+    NonAuthentifie:
+      description: Authentification requise, jeton invalide, ou confirmation par PIN requise (code CONFIRMATION_PIN_REQUISE)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Erreur' }
+    Interdit:
+      description: Droits insuffisants
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Erreur' }
+    Introuvable:
+      description: Ressource introuvable (ou appartenant à un autre compte)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Erreur' }
+    Conflit:
+      description: Conflit (doublon, modification concurrente)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Erreur' }
+    TropDeRequetes:
+      description: Limitation ou verrouillage (voir l'en-tête Retry-After)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Erreur' }
+    Indisponible:
+      description: Service tiers ou base momentanément indisponible
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Erreur' }

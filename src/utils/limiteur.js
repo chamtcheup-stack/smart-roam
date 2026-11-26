@@ -39,6 +39,17 @@ class CompteurFenetre {
     }
   }
 
+  // Lecture sans incrément (ex. ne compter que les échecs, mais vérifier avant d'agir).
+  lire (cle, maintenant = Date.now()) {
+    const entree = this.entrees.get(cle)
+    const actif = entree && maintenant < entree.finFenetre
+    return {
+      compte: actif ? entree.compte : 0,
+      depasse: actif ? entree.compte >= this.max : false,
+      reessayerDansSecondes: actif ? Math.max(1, Math.ceil((entree.finFenetre - maintenant) / 1000)) : 0
+    }
+  }
+
   reinitialiser (cle) {
     this.entrees.delete(cle)
   }
@@ -46,6 +57,72 @@ class CompteurFenetre {
   nettoyer (maintenant = Date.now()) {
     for (const [cle, entree] of this.entrees) {
       if (maintenant >= entree.finFenetre) this.entrees.delete(cle)
+    }
+  }
+}
+
+// Verrou progressif : chaque verrouillage successif dure plus longtemps
+// (paliers), jusqu'à une réussite ou 24 h sans nouveau verrouillage.
+// Avec 5 essais par palier (15 min, 1 h, 4 h, puis 24 h), un PIN à 4 chiffres
+// ne peut plus être essayé qu'environ 25 fois par jour au lieu de 480.
+class VerrouProgressif {
+  constructor ({
+    maxEchecs = 5,
+    fenetreMs = 15 * 60 * 1000,
+    paliersMs = [15 * 60 * 1000, 60 * 60 * 1000, 4 * 60 * 60 * 1000, 24 * 60 * 60 * 1000],
+    oubliMs = 24 * 60 * 60 * 1000
+  } = {}) {
+    this.maxEchecs = maxEchecs
+    this.fenetreMs = fenetreMs
+    this.paliersMs = paliersMs
+    this.oubliMs = oubliMs
+    this.entrees = new Map()
+    demarrerNettoyage(this, fenetreMs)
+  }
+
+  etat (cle, maintenant = Date.now()) {
+    const entree = this.entrees.get(cle)
+    if (entree && entree.bloqueJusqua > maintenant) {
+      return { bloque: true, reessayerDansSecondes: Math.ceil((entree.bloqueJusqua - maintenant) / 1000), niveau: entree.niveau }
+    }
+    return { bloque: false, reessayerDansSecondes: 0, niveau: entree ? entree.niveau : 0 }
+  }
+
+  enregistrerEchec (cle, maintenant = Date.now()) {
+    let entree = this.entrees.get(cle)
+    if (!entree) {
+      entree = { echecs: 0, debutFenetre: maintenant, bloqueJusqua: 0, niveau: 0, dernierBlocage: 0 }
+      this.entrees.set(cle, entree)
+    }
+    if (entree.niveau > 0 && maintenant - entree.dernierBlocage > this.oubliMs) entree.niveau = 0
+    if (maintenant - entree.debutFenetre > this.fenetreMs) {
+      entree.echecs = 0
+      entree.debutFenetre = maintenant
+    }
+
+    entree.echecs += 1
+    if (entree.echecs < this.maxEchecs) {
+      return { bloque: false, echecsRestants: this.maxEchecs - entree.echecs, reessayerDansSecondes: 0, niveau: entree.niveau }
+    }
+
+    const duree = this.paliersMs[Math.min(entree.niveau, this.paliersMs.length - 1)]
+    entree.bloqueJusqua = maintenant + duree
+    entree.niveau += 1
+    entree.dernierBlocage = maintenant
+    entree.echecs = 0
+    entree.debutFenetre = maintenant
+    return { bloque: true, echecsRestants: 0, reessayerDansSecondes: Math.ceil(duree / 1000), niveau: entree.niveau }
+  }
+
+  reinitialiser (cle) {
+    this.entrees.delete(cle)
+  }
+
+  nettoyer (maintenant = Date.now()) {
+    for (const [cle, entree] of this.entrees) {
+      const inactif = maintenant - entree.debutFenetre > this.fenetreMs && entree.bloqueJusqua <= maintenant
+      const oublie = entree.niveau === 0 || maintenant - entree.dernierBlocage > this.oubliMs
+      if (inactif && oublie) this.entrees.delete(cle)
     }
   }
 }
@@ -115,4 +192,4 @@ const limiterDebit = ({
   return middleware
 }
 
-module.exports = { CompteurFenetre, VerrouTentatives, limiterDebit }
+module.exports = { CompteurFenetre, VerrouTentatives, VerrouProgressif, limiterDebit }

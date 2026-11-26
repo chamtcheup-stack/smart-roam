@@ -3,7 +3,14 @@
 const supabase = require('../supabase')
 const v = require('../utils/validation')
 const { requeteInvalide, introuvable, conflit } = require('../utils/http')
-const { donnees, estViolationUnicite, executerSansEchec, paginer, ErreurBase } = require('../utils/db')
+const {
+  donnees,
+  estViolationUnicite,
+  executerSansEchec,
+  insererAvecColonnesOptionnelles,
+  paginer,
+  ErreurBase
+} = require('../utils/db')
 const { auditerRequete } = require('../utils/audit')
 const { genererTokens, determinerRole, revoquerTousTokens } = require('../algorithms/algo10_zeroTrustJWT')
 const { resoudreRegionCloud } = require('../algorithms/algo14_cloisonnementSouverainete')
@@ -51,20 +58,18 @@ const inscrireUtilisateur = async (req, res) => {
   )
   if (!pays) throw requeteInvalide(`Pays introuvable : ${paysResidence}`, { champ: 'countryResidence' })
 
-  const { data: user, error } = await supabase
-    .from('users')
-    .insert([{
-      phone_number: telephone,
-      country_of_residence: paysResidence,
-      kyc_status: 'PENDING',
-      plan_id: planId,
-      data_region: pays.data_region || resoudreRegionCloud(paysResidence).region,
-      residence_status: 'RESIDENT',
-      global_identity_status: 'PENDING_SYNC',
-      user_origin_type: 'ORANGE_NATIVE'
-    }])
-    .select()
-    .single()
+  // Colonnes descriptives optionnelles : ignorées si absentes du schéma réel
+  // (ex. user_origin_type), sans empêcher l'inscription.
+  const { data: user, error } = await insererAvecColonnesOptionnelles(supabase, 'users', {
+    phone_number: telephone,
+    country_of_residence: paysResidence,
+    kyc_status: 'PENDING',
+    plan_id: planId,
+    data_region: pays.data_region || resoudreRegionCloud(paysResidence).region,
+    residence_status: 'RESIDENT',
+    global_identity_status: 'PENDING_SYNC',
+    user_origin_type: 'ORANGE_NATIVE'
+  }, ['plan_id', 'residence_status', 'global_identity_status', 'user_origin_type'])
 
   if (error) {
     // Deux inscriptions simultanées du même numéro : la contrainte d'unicité tranche.

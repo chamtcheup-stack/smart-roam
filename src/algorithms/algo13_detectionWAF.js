@@ -15,10 +15,13 @@
 // est autorisée (fail-open) pour préserver la disponibilité.
 // ════════════════════════════════════════════════════════════
 
+const config = require('../config')
 const logger = require('../utils/logger')
 const { journaliserAudit } = require('../utils/audit')
 
-const MAX_REQUETES_PAR_SECONDE = 100
+// Réglable (WAF_MAX_REQUETES_SECONDE) : une IP d'opérateur mobile (CGNAT)
+// peut regrouper des milliers d'abonnés.
+const MAX_REQUETES_PAR_SECONDE = config.limites.wafRequetesParSeconde
 const DUREE_BLOCAGE_COURT = 60 // secondes
 const DUREE_BLOCAGE_LONG = 3600 // secondes (injections)
 const SEUIL_REPUTATION_BAS = 0.30

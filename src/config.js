@@ -9,6 +9,7 @@
 // Les tests sont hermétiques : ils ne lisent jamais le fichier .env réel.
 if (process.env.NODE_ENV !== 'test') require('dotenv').config({ quiet: true })
 const crypto = require('crypto')
+const { analyserCleSupabase, MESSAGE_CLE_PUBLIQUE } = require('./utils/cleSupabase')
 
 const env = process.env
 const environnement = env.NODE_ENV || 'development'
@@ -46,6 +47,11 @@ if (!jwtSecret || jwtSecret.length < 32) {
   }
 }
 
+// Clé Supabase publique utilisée côté serveur : mauvaise configuration grave.
+if (analyserCleSupabase(env.SUPABASE_KEY).adapteeAuServeur === false) {
+  avertissements.push(MESSAGE_CLE_PUBLIQUE)
+}
+
 if (!env.PIN_PEPPER && estProduction) {
   avertissements.push('PIN_PEPPER absent : les PIN sont hachés sans poivre secret (fortement déconseillé en production)')
 }
@@ -62,12 +68,26 @@ const config = Object.freeze({
   estTest,
   port: entier(env.PORT, 3000),
   logLevel: env.LOG_LEVEL || (estProduction ? 'info' : 'debug'),
+  // texte (lisible) ou json (une ligne JSON par évènement, pour un outil de supervision)
+  logFormat: env.LOG_FORMAT === 'json' ? 'json' : 'texte',
   trustProxy: lireTrustProxy(env.TRUST_PROXY),
   corsOrigins,
 
   supabase: Object.freeze({
     url: env.SUPABASE_URL || '',
-    cle: env.SUPABASE_KEY || ''
+    cle: env.SUPABASE_KEY || '',
+    // Délai maximal d'une requête vers Supabase (une base lente ne bloque plus l'API).
+    delaiMs: Math.max(500, entier(env.SUPABASE_TIMEOUT_MS, 8000))
+  }),
+
+  // Limitations par adresse IP. Les opérateurs mobiles partagent une même IP
+  // publique entre des milliers d'abonnés (CGNAT) : seuils volontairement
+  // élevés, la protection fine se fait par compte (verrou progressif).
+  limites: Object.freeze({
+    connexionsParIP15min: Math.max(1, entier(env.LIMITE_CONNEXIONS_IP_15MIN, 300)),
+    echecsConnexionParIP15min: Math.max(1, entier(env.LIMITE_ECHECS_CONNEXION_IP_15MIN, 100)),
+    inscriptionsParIPHeure: Math.max(1, entier(env.LIMITE_INSCRIPTIONS_IP_HEURE, 100)),
+    wafRequetesParSeconde: Math.max(1, entier(env.WAF_MAX_REQUETES_SECONDE, 100))
   }),
 
   jwt: Object.freeze({
@@ -93,6 +113,8 @@ const config = Object.freeze({
   }),
 
   jitIntervalleMinutes: Math.max(0, entier(env.JIT_INTERVAL_MINUTES, 0)),
+  // Clôture des voyages échus, expiration des forfaits eSIM, purge des sessions.
+  maintenanceIntervalleMinutes: Math.max(0, entier(env.MAINTENANCE_INTERVAL_MINUTES, estTest ? 0 : 60)),
   // Taux de référence BCE (appel HTTPS sortant) : désactivé en test.
   tauxBCEActif: env.ECB_RATES_ENABLED !== undefined ? env.ECB_RATES_ENABLED === 'true' : !estTest,
   iccidEmetteur: /^\d{2}$/.test(env.ICCID_ISSUER_ID || '') ? env.ICCID_ISSUER_ID : '01',

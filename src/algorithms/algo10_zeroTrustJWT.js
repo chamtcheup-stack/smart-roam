@@ -66,11 +66,15 @@ const determinerRole = (utilisateur) => {
   return String(utilisateur.role || '').toUpperCase() === ROLE_ADMIN ? ROLE_ADMIN : ROLE_USER
 }
 
-const construirePayload = ({ userId, role, deviceId, sessionId }) => ({
+// apc : appareil déjà connu du compte (true / false / null = inconnu), utilisé
+// par la règle anti-fraude DEVICE. sens : jeton d'opération sensible (PIN confirmé).
+const construirePayload = ({ userId, role, deviceId, sessionId, appareilConnu = null, sensible = false }) => ({
   sub: String(userId),
   role,
   did: deviceId || null,
   sid: sessionId,
+  apc: typeof appareilConnu === 'boolean' ? appareilConnu : null,
+  ...(sensible ? { sens: true } : {}),
   iat_ms: Date.now() // précision milliseconde pour la révocation
 })
 
@@ -151,10 +155,10 @@ const supprimerSessionsUtilisateur = async (userId) => {
 }
 
 // ── Traitement principal ────────────────────────────────────
-const genererTokens = async ({ userId, role = ROLE_USER, deviceId = null, operationSensible = false }) => {
+const genererTokens = async ({ userId, role = ROLE_USER, deviceId = null, operationSensible = false, appareilConnu = null }) => {
   const dureeAcces = determinerDureeExpiration(operationSensible)
   const sessionId = crypto.randomUUID()
-  const accessToken = genererAccessToken(construirePayload({ userId, role, deviceId, sessionId }), dureeAcces)
+  const accessToken = genererAccessToken(construirePayload({ userId, role, deviceId, sessionId, appareilConnu }), dureeAcces)
   const refreshToken = genererRefreshToken()
   const expiration = new Date(Date.now() + dureeRefreshMinutes * MS_PAR_MINUTE)
 
@@ -196,12 +200,31 @@ const verifierToken = (tokenRecu) => {
   }
   const revoqueLe = revocationsUtilisateur.get(payload.sub)
   const emisLe = payload.iat_ms || payload.iat * 1000
-  if (revoqueLe && emisLe < revoqueLe) {
+  // <= : un jeton émis dans la même milliseconde que la révocation est révoqué.
+  if (revoqueLe && emisLe <= revoqueLe) {
     throw nonAuthentifie('Jetons révoqués : reconnexion requise', { code: 'TOKENS_REVOQUES' })
   }
 
-  return { userId: payload.sub, role: payload.role, deviceId: payload.did || null, sessionId: payload.sid }
+  return {
+    userId: payload.sub,
+    role: payload.role,
+    deviceId: payload.did || null,
+    sessionId: payload.sid,
+    appareilConnu: typeof payload.apc === 'boolean' ? payload.apc : null,
+    sensible: payload.sens === true
+  }
 }
+
+// Jeton d'opération sensible (5 min) délivré après confirmation du PIN :
+// rattaché à la session courante (révoqué avec elle), sans refresh token.
+const genererJetonSensible = ({ userId, role, deviceId = null, sessionId, appareilConnu = null }) => ({
+  token_type: 'Bearer',
+  access_token: genererAccessToken(
+    construirePayload({ userId, role, deviceId, sessionId, appareilConnu, sensible: true }),
+    dureeAccesSensibleMinutes
+  ),
+  expires_in: dureeAccesSensibleMinutes * 60
+})
 
 const revoquerTousTokens = async (userId) => {
   revocationsUtilisateur.set(String(userId), Date.now())
@@ -241,7 +264,9 @@ const renouvelerTokens = async (refreshToken, chargerUtilisateur) => {
   return genererTokens({
     userId: session.user_id,
     role: determinerRole(utilisateur),
-    deviceId: session.device_id
+    deviceId: session.device_id,
+    // Appareil enregistré lors de la connexion initiale de cette session.
+    appareilConnu: session.device_id ? true : null
   })
 }
 
@@ -251,6 +276,7 @@ module.exports = {
   determinerDureeExpiration,
   determinerRole,
   genererTokens,
+  genererJetonSensible,
   verifierToken,
   renouvelerTokens,
   revoquerSession,

@@ -4,6 +4,7 @@ const supabase = require('../supabase')
 const v = require('../utils/validation')
 const { introuvable, requeteInvalide, conflit } = require('../utils/http')
 const { donnees, paginer, executerSansEchec } = require('../utils/db')
+const { executerEnExclusion } = require('../utils/exclusion')
 const { declarerDestination: declarer } = require('../algorithms/algo20_declarationDestination')
 
 // ════════════════════════════════════════════
@@ -17,7 +18,8 @@ const declarerDestination = async (req, res) => {
   const dateDepart = v.date(req.body.dateDepart, 'dateDepart')
   const dateRetour = v.date(req.body.dateRetour, 'dateRetour', { optionnel: true }) || null
 
-  const resultat = await declarer({ userId, paysISO, dateDepart, dateRetour })
+  // Deux déclarations simultanées du même voyage : la seconde retrouve la première.
+  const resultat = await executerEnExclusion(`declaration:${userId}`, () => declarer({ userId, paysISO, dateDepart, dateRetour }))
 
   if (resultat.statut === 'EXISTANTE') {
     return res.status(200).json({

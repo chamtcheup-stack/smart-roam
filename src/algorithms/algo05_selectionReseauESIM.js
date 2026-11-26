@@ -32,6 +32,7 @@ const POIDS_COUT = 0.10
 const DELAI_PROVISIONING_SECONDES = 60
 const PLAN_DEFAUT = 'WEEK'
 const QUOTA_DATA_MO = { DAY: 200, WEEK: 1024, MONTH: 5120 }
+const DUREE_FORFAIT_JOURS = Object.freeze({ DAY: 1, WEEK: 7, MONTH: 30 }) // BYOE : sans échéance
 const LONGUEUR_ICCID_SANS_CLE = 18
 const MAX_ESSAIS_ICCID = 3
 
@@ -72,6 +73,14 @@ const genererICCID = (paysISO, emetteur = config.iccidEmetteur) => {
   const prefixe = `89${INDICATIFS[paysISO] || INDICATIF_PAR_DEFAUT}${emetteur}`
   const corps = prefixe + chiffresAleatoires(LONGUEUR_ICCID_SANS_CLE - prefixe.length)
   return corps + calculerCleLuhn(corps)
+}
+
+// Échéance du forfait : activation (ou création) + durée du plan ; null si sans échéance.
+const calculerExpirationForfait = (esim) => {
+  const jours = DUREE_FORFAIT_JOURS[esim && esim.plan_type]
+  const debut = Date.parse((esim && (esim.activated_at || esim.created_at)) || '')
+  if (!jours || !Number.isFinite(debut)) return null
+  return new Date(debut + jours * 24 * 60 * 60 * 1000).toISOString()
 }
 
 // ── Lectures ────────────────────────────────────────────────
@@ -267,6 +276,8 @@ const selectionReseauEsim = async ({ userId, numberId, paysISO, plan = PLAN_DEFA
 module.exports = {
   PLAN_DEFAUT,
   QUOTA_DATA_MO,
+  DUREE_FORFAIT_JOURS,
+  calculerExpirationForfait,
   calculerCleLuhn,
   verifierLuhn,
   genererICCID,

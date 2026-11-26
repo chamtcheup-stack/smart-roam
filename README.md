@@ -15,7 +15,8 @@ npm install
 cp .env.example .env        # puis renseigner SUPABASE_URL, SUPABASE_KEY, JWT_SECRET…
 npm run dev                 # rechargement automatique (node --watch)
 npm start                   # production
-npm test                    # 135 tests, sans réseau ni base réelle
+npm test                    # 175 tests, sans réseau ni base réelle
+npm run verifier:schema     # compare votre base Supabase au schéma attendu (lecture seule)
 ```
 
 Vérification : `GET http://localhost:3000/api/health` (processus) et `GET /api/ready` (base joignable).
@@ -37,6 +38,10 @@ Vérification : `GET http://localhost:3000/api/health` (processus) et `GET /api/
 | `PARTNER_TLS_PINS`, `PARTNER_TLS_PINS_EXPIRES_AT` | non | Empreintes SPKI SHA-256 des partenaires (certificate pinning). |
 | `ECB_RATES_ENABLED` | non | Taux de référence BCE pour les paires hors EUR/XAF/XOF (`true` par défaut). |
 | `JIT_INTERVAL_MINUTES` | non | Fréquence du réapprovisionnement automatique des pools DID (`0` = désactivé). |
+| `MAINTENANCE_INTERVAL_MINUTES` | non | Clôture des voyages échus, expiration des forfaits eSIM, purge des sessions (`60` par défaut). |
+| `SUPABASE_TIMEOUT_MS` | non | Délai maximal d'une requête vers la base (`8000`) : au-delà, réponse 503 au lieu d'une requête bloquée. |
+| `LIMITE_CONNEXIONS_IP_15MIN`, `LIMITE_ECHECS_CONNEXION_IP_15MIN`, `LIMITE_INSCRIPTIONS_IP_HEURE`, `WAF_MAX_REQUETES_SECONDE` | non | Seuils par adresse IP, élevés par défaut : les opérateurs mobiles partagent une IP entre des milliers d'abonnés (CGNAT). |
+| `LOG_FORMAT` | non | `texte` ou `json` (une ligne JSON par évènement, pour un outil de supervision). |
 | `ICCID_ISSUER_ID`, `PORT`, `NODE_ENV`, `LOG_LEVEL` | non | Voir `.env.example`. |
 
 ---
@@ -52,9 +57,13 @@ src/controllers/           couche HTTP : validation des entrées, appel des algo
 src/algorithms/            règles métier (algos 01 à 20), indépendantes d'Express
 src/middlewares/           auth (JWT / clé de service), erreurs JSON, sécurité, idempotence
 src/utils/                 validation, accès base, journalisation sans PII, audit, limiteurs
-src/taches/                planification du JIT Stock Manager
+src/taches/                tâches planifiées : JIT Stock Manager, maintenance
+src/outils/                schéma attendu et vérification du schéma réel
+scripts/verifier-schema.js commande « npm run verifier:schema »
+docs/openapi.yaml          spécification OpenAPI 3.1 (servie hors production sur /api/docs/openapi.yaml)
 database/schema_attendu.sql   schéma attendu (déduit du code) + contraintes recommandées
 test/                      tests unitaires et d'intégration (node:test, Supabase simulé)
+.github/workflows/         intégration continue (tests sur Node 22 et 24, audit des dépendances)
 ```
 
 | Algo | Rôle | Utilisé par |
@@ -92,13 +101,26 @@ test/                      tests unitaires et d'intégration (node:test, Supabas
 | `ADMIN` | `ADMIN_USER_IDS` ou `users.role = 'ADMIN'` | tous les comptes, opérations d'exploitation |
 | `SERVICE` | en-tête `x-api-key: <SERVICE_API_KEY>` | appels machine-à-machine (évaluation d'appel, stock, KYC) |
 
-Changer de PIN exige l'ancien PIN et révoque les sessions. Cinq échecs de PIN ou de connexion verrouillent le compte 15 minutes.
+Changer de PIN exige l'ancien PIN et révoque les sessions.
+
+**Confirmation par PIN des opérations sensibles** (conversion de devises, suppression du compte) :
+`POST /api/security/pin/verify` renvoie un `jetonSensible` valable 5 minutes, rattaché à la session.
+Sans lui, ces opérations répondent `401` avec le code `CONFIRMATION_PIN_REQUISE`.
+
+**Verrou progressif anti-force brute**, partagé par la connexion et la vérification du PIN :
+après 5 échecs, le compte est verrouillé 15 min, puis 1 h, 4 h et 24 h aux verrouillages suivants.
+Le niveau est oublié après 24 h sans incident. Un PIN à 4 chiffres ne peut ainsi plus être essayé
+qu'environ 25 fois par jour. Le support lève un verrou avec `POST /api/security/pin/unlock` (ADMIN / SERVICE).
+Par adresse IP, seuls les **échecs** de connexion sont comptés : des milliers d'abonnés derrière une même IP
+d'opérateur peuvent se connecter normalement.
 
 ---
 
 ## Endpoints
 
-🌐 public · 👤 utilisateur (ses données) · 🛡️ ADMIN/SERVICE · 🔑 idempotent (`Idempotency-Key` recommandé)
+🌐 public · 👤 utilisateur (ses données) · 🛡️ ADMIN/SERVICE · 🔐 PIN confirmé (jeton sensible) · 🔑 idempotent (`Idempotency-Key` recommandé)
+
+Spécification complète : [`docs/openapi.yaml`](docs/openapi.yaml). Un test vérifie qu'elle reste alignée sur les routes réelles.
 
 | Méthode | Chemin | Accès | Description |
 |---|---|---|---|
@@ -106,10 +128,11 @@ Changer de PIN exige l'ancien PIN et révoque les sessions. Cinq échecs de PIN 
 | POST | `/api/auth/login`, `/api/auth/refresh` | 🌐 | Connexion, renouvellement des jetons |
 | POST | `/api/auth/logout`, `/api/auth/logout-all` | 👤 | Déconnexion |
 | POST | `/api/users/register` | 🌐 | Inscription |
-| GET / DELETE | `/api/users/:userId` | 👤 | Profil (liste blanche de champs) / suppression logique |
+| GET / DELETE | `/api/users/:userId` | 👤 / 👤 🔐 | Profil (liste blanche de champs) / suppression logique |
 | GET | `/api/users/:userId/numbers` | 👤 | Numéros virtuels (paginé) |
 | PUT | `/api/users/:userId/kyc` | 🛡️ | Statut KYC |
 | POST | `/api/security/pin/create`, `/pin/verify` | 👤 | PIN : création / changement, vérification |
+| POST | `/api/security/pin/unlock` | 🛡️ | Lever le verrouillage anti-force brute d'un compte |
 | POST | `/api/security/waf/analyze` | 🛡️ | Simulation du WAF sur une charge utile |
 | POST | `/api/declarations/new` | 👤 🔑 | Déclarer un voyage (attribue le numéro) |
 | GET | `/api/declarations/:userId` | 👤 | Déclarations (paginé) |
@@ -124,7 +147,7 @@ Changer de PIN exige l'ancien PIN et révoque les sessions. Cinq échecs de PIN 
 | GET | `/api/esim/:userId` | 👤 | eSIM (paginé) |
 | GET | `/api/currency/corridors` | 👤 | Corridors ouverts |
 | POST | `/api/currency/preview` | 👤 | Devis de conversion |
-| POST | `/api/currency/confirm` | 👤 🔑 | Conversion (contrôle anti-fraude inclus) |
+| POST | `/api/currency/confirm` | 👤 🔐 🔑 | Conversion (contrôle anti-fraude inclus) |
 | GET | `/api/currency/history/:userId` | 👤 | Transactions (paginé) |
 | POST | `/api/mirror/sync`, `/api/mirror/consent` | 👤 | Profil miroir, consentements |
 | GET | `/api/mirror/:userId` | 👤 | Profils miroir (paginé) |
@@ -138,8 +161,9 @@ Changer de PIN exige l'ancien PIN et révoque les sessions. Cinq échecs de PIN 
 
 ## Conventions
 
-- **Erreurs** : JSON `{ "erreur": "…", …détails }`. Une erreur 500 ne renvoie jamais de détail interne, mais une `reference` à retrouver dans les journaux.
-- **Codes** : 400 validation · 401 authentification · 403 droits · 404 introuvable (ou ressource d'un autre compte) · 409 conflit · 422 clé d'idempotence réutilisée · 429 limitation (`Retry-After`) · 503 service tiers indisponible.
+- **Erreurs** : JSON `{ "erreur": "…", …détails }`. Une erreur 500 ne renvoie jamais de détail interne, mais une `reference` égale à l'en-tête `X-Request-Id`, présent dans toutes les lignes de journal de la requête.
+- **Traçage** : chaque réponse porte un `X-Request-Id` (repris s'il est fourni par un proxy, généré sinon).
+- **Codes** : 400 validation · 401 authentification (ou `CONFIRMATION_PIN_REQUISE`) · 403 droits · 404 introuvable (ou ressource d'un autre compte) · 409 conflit · 422 clé d'idempotence réutilisée · 429 limitation ou verrouillage (`Retry-After`) · 503 base trop lente ou service tiers indisponible.
 - **Pagination** : `?limit=` (1–200, défaut 50) et `?offset=` ; réponse `{ …, total, limit, offset }`.
 - **Idempotence** : en-tête `Idempotency-Key` (8–128 caractères). Une requête rejouée renvoie la même réponse (`Idempotent-Replayed: true`).
 - **Formats** : téléphones E.164, pays ISO 3166-1 alpha-2, devises ISO 4217, dates ISO 8601.
@@ -156,9 +180,28 @@ Changer de PIN exige l'ancien PIN et révoque les sessions. Cinq échecs de PIN 
 
 ---
 
+## Exploitation
+
+- **Maintenance planifiée** (toutes les 60 min par défaut) :
+  - un voyage confirmé dont la date de retour est dépassée de 2 jours est clôturé ;
+  - un voyage jamais commencé est annulé ;
+  - les numéros devenus inutiles sont mis en parking ;
+  - les forfaits eSIM DAY / WEEK / MONTH échus expirent ;
+  - les sessions expirées sont purgées.
+
+  Toutes ces mises à jour sont conditionnelles : elles n'écrasent jamais une arrivée détectée entre-temps.
+- **Concurrence** : les conversions, déclarations et provisionings eSIM d'un même utilisateur sont exécutés l'un après l'autre (contrôle anti-fraude non contournable par des requêtes simultanées).
+- **Base lente** : chaque requête Supabase a un délai maximal (`SUPABASE_TIMEOUT_MS`), sans nouvelles tentatives qui cumuleraient les délais.
+- **Journaux** : identifiant de requête sur chaque ligne, journal d'accès (méthode, chemin, statut, durée), format JSON optionnel (`LOG_FORMAT=json`).
+- **Pool de threads** : `UV_THREADPOOL_SIZE` vaut 16 par défaut. Le hachage des PIN ne bloque plus le reste de l'API lors d'un afflux de connexions.
+
 ## Base de données
 
-Le schéma attendu est décrit dans [`database/schema_attendu.sql`](database/schema_attendu.sql), **déduit du code** : à comparer au schéma réel avant toute exécution.
+Le schéma attendu est décrit dans [`database/schema_attendu.sql`](database/schema_attendu.sql), **déduit du code**.
+
+**Avant la mise en production, lancez `npm run verifier:schema`.** La commande compare votre base à ce que le code attend.
+Elle est en lecture seule (`SELECT … LIMIT 0`, aucune donnée lue) et vérifie aussi que la clé utilisée est bien une clé serveur.
+Code de sortie : 0 conforme, 1 écart bloquant, 2 base injoignable.
 
 Le backend tolère l'absence des éléments optionnels :
 
@@ -171,6 +214,19 @@ Chaque repli est signalé dans les journaux.
 
 Contraintes uniques fortement recommandées : `users.phone_number`, `virtual_number.did_number`, `esim_profile.iccid`. Les deux dernières complètent l'attribution atomique des numéros.
 
+### Aligner une base existante
+
+Pour une base existante, suivez [`database/migrations/001_alignement_supabase.sql`](database/migrations/001_alignement_supabase.sql) (non destructive), **dans cet ordre** :
+
+1. Mettre la **clé secrète** (`sb_secret_…`) dans `SUPABASE_KEY`, puis redémarrer le backend. Une clé `publishable` est publique : avec la RLS, le backend ne peut pas écrire ; sans RLS, n'importe qui peut lire et modifier la base.
+2. **Section 0** : diagnostics en lecture seule (état de la RLS, contraintes uniques, doublons).
+3. **Sections 1 et 2** : table `session` (sinon déconnexion de tous à chaque redémarrage) et contraintes uniques.
+4. **Section 3**, facultative : colonnes qui activent le nom et la photo du profil miroir, le roaming UE gratuit et le score des partenaires.
+5. **Section 4** : activer la RLS sur toutes les tables.
+6. Redémarrer le backend et relancer `npm run verifier:schema`.
+
+Le backend s'adapte au schéma réel : une colonne optionnelle absente est simplement ignorée, et mémorisée pour ne plus être envoyée. Les autres données de la ligne sont conservées.
+
 ---
 
 ## Limites connues et intégrations à brancher
@@ -181,7 +237,9 @@ Contraintes uniques fortement recommandées : `users.phone_number`, `virtual_num
 | SM-DP+ (eSIM) et commandes aux partenaires MVNO | **simulés** (avertissement journalisé) | intégrations GSMA ES2+ et API partenaires (avec `creerAgentHttpsEpingle`) |
 | Notifications utilisateur (fraude, voyage) | journalisées | push / SMS |
 | Pays de l'adresse IP | fourni par le client (`paysIP`) | GeoIP côté serveur |
-| Limiteurs, WAF, idempotence, révocations | en mémoire (un processus) | magasin partagé (Redis) en multi-instances |
+| Limiteurs, verrous, WAF, idempotence, révocations, exclusion par utilisateur | en mémoire (un processus) | magasin partagé (Redis) en multi-instances |
+| Conversion de devises | enregistrée en base, **aucun débit Orange Money** | API Orange Money (débit, solde) |
+| Opérations en plusieurs étapes | sans transaction SQL (états partiels possibles en cas de panne) | fonctions PostgreSQL appelées par RPC |
 | Suppression de compte | logique (`deleted_at`) | politique de conservation / anonymisation RGPD |
 | Consentement contractuel par défaut pour le nom (algo 18) | appliqué pendant 30 jours si aucun choix n'existe | à valider par le DPO |
 

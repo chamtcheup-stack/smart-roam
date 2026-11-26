@@ -1,5 +1,10 @@
 'use strict'
 
+// Le hachage scrypt des PIN s'exécute dans le pool de threads de libuv (4 par
+// défaut), partagé avec la résolution DNS des appels Supabase : un afflux de
+// connexions ralentirait toute l'API. À définir avant toute opération asynchrone.
+if (!process.env.UV_THREADPOOL_SIZE) process.env.UV_THREADPOOL_SIZE = '16'
+
 const config = require('./src/config')
 const logger = require('./src/utils/logger')
 const { creerApp } = require('./src/app')

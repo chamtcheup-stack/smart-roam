@@ -5,9 +5,12 @@ const v = require('../utils/validation')
 const logger = require('../utils/logger')
 const { nonAuthentifie, tropDeRequetes } = require('../utils/http')
 const { donnees } = require('../utils/db')
-const { VerrouTentatives } = require('../utils/limiteur')
+const config = require('../config')
+const { CompteurFenetre } = require('../utils/limiteur')
+const { verrouCompte, cleCompte, cleTelephone } = require('../utils/verrouCompte')
 const { auditerRequete } = require('../utils/audit')
 const { verifierPINUtilisateur } = require('../algorithms/algo11_hachagePIN')
+const { enregistrerAppareil } = require('../algorithms/algo07_detectionFraude')
 const {
   genererTokens,
   renouvelerTokens,
@@ -18,13 +21,11 @@ const {
 
 const QUINZE_MINUTES = 15 * 60 * 1000
 const MESSAGE_VERROUILLE = 'Trop de tentatives de connexion : compte temporairement verrouillé'
+const MESSAGE_ECHECS_IP = "Trop d'échecs de connexion depuis cette adresse, réessayez plus tard"
 
-// 5 échecs en 15 minutes sur un même numéro → connexion bloquée 15 minutes.
-const verrouConnexion = new VerrouTentatives({
-  maxEchecs: 5,
-  fenetreMs: QUINZE_MINUTES,
-  dureeBlocageMs: QUINZE_MINUTES
-})
+// Seuls les ÉCHECS sont comptés par adresse IP : des milliers d'abonnés
+// peuvent partager la même IP publique (CGNAT) et se connecter normalement.
+const echecsParIP = new CompteurFenetre({ fenetreMs: QUINZE_MINUTES, max: config.limites.echecsConnexionParIP15min })
 
 const chargerUtilisateurParTelephone = async (telephone) => {
   const lignes = donnees(
@@ -58,16 +59,23 @@ const connexion = async (req, res) => {
   const pin = v.pin(req.body.pin, 'pin')
   const deviceId = v.chaine(req.body.deviceId, 'deviceId', { optionnel: true, max: 128 }) || null
 
-  const cleVerrou = `tel:${telephone}`
-  const verrou = verrouConnexion.etat(cleVerrou)
+  const ip = req.ip || 'inconnue'
+  const echecsIP = echecsParIP.lire(ip)
+  if (echecsIP.depasse) throw tropDeRequetes(MESSAGE_ECHECS_IP, echecsIP.reessayerDansSecondes)
+
+  // Verrou partagé avec la vérification du PIN : clé du compte s'il existe,
+  // du numéro sinon (comportement identique, aucune énumération).
+  const utilisateur = await chargerUtilisateurParTelephone(telephone)
+  const cleVerrou = utilisateur ? cleCompte(utilisateur.user_id) : cleTelephone(telephone)
+  const verrou = verrouCompte.etat(cleVerrou)
   if (verrou.bloque) throw tropDeRequetes(MESSAGE_VERROUILLE, verrou.reessayerDansSecondes)
 
   // Compte inconnu ou sans PIN : même message et même coût de calcul.
-  const utilisateur = await chargerUtilisateurParTelephone(telephone)
   const { valide } = await verifierPINUtilisateur(utilisateur, pin)
 
   if (!valide) {
-    const echec = verrouConnexion.enregistrerEchec(cleVerrou)
+    echecsParIP.consommer(ip)
+    const echec = verrouCompte.enregistrerEchec(cleVerrou)
     const userId = utilisateur ? utilisateur.user_id : null
     logger.info('Échec de connexion', { telephone: logger.masquerTelephone(telephone) })
     void auditerRequete(req, { userId, entite: 'AUTH', action: echec.bloque ? 'COMPTE_VERROUILLE' : 'CONNEXION_ECHOUEE' })
@@ -75,12 +83,17 @@ const connexion = async (req, res) => {
     throw nonAuthentifie('Numéro de téléphone ou PIN incorrect')
   }
 
-  verrouConnexion.reinitialiser(cleVerrou)
+  verrouCompte.reinitialiser(cleVerrou)
+  verrouCompte.reinitialiser(cleTelephone(telephone))
   void auditerRequete(req, { userId: utilisateur.user_id, entite: 'AUTH', action: 'CONNEXION_REUSSIE' })
+
+  // Appareil enregistré : la règle anti-fraude DEVICE saura s'il est nouveau.
+  const appareilConnu = await enregistrerAppareil(utilisateur.user_id, deviceId)
   const tokens = await genererTokens({
     userId: utilisateur.user_id,
     role: determinerRole(utilisateur),
-    deviceId
+    deviceId,
+    appareilConnu
   })
 
   return res.status(200).json({
@@ -125,5 +138,5 @@ module.exports = {
   deconnexionGlobale,
   chargerUtilisateurActif,
   profilPublic,
-  verrouConnexion
+  echecsParIP
 }

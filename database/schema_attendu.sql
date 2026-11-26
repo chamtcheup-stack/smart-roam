@@ -7,7 +7,8 @@
 -- uniques échouent si des doublons existent déjà : les nettoyer d'abord.
 --
 -- Légende : [optionnel] = le backend fonctionne sans (repli documenté).
--- Le backend doit utiliser la clé service_role (RLS contournée côté serveur).
+-- Le backend doit utiliser la clé secrète (sb_secret_… / service_role), RLS activée.
+-- Base existante : voir plutôt database/migrations/001_alignement_supabase.sql.
 -- ════════════════════════════════════════════════════════════════════
 
 -- ── Référentiels ────────────────────────────────────────────────────
@@ -26,11 +27,11 @@ create table if not exists users (
   country_of_residence    char(2) references country (country_iso),
   kyc_status              text not null default 'PENDING',   -- PENDING | VERIFIED | REJECTED
   kyc_verified_at         timestamptz,
-  plan_id                 uuid,
+  plan_id                 uuid,                   -- [optionnel]
   data_region             text,
-  residence_status        text,
-  global_identity_status  text,
-  user_origin_type        text,
+  residence_status        text,                   -- [optionnel]
+  global_identity_status  text,                   -- [optionnel]
+  user_origin_type        text,                   -- [optionnel]
   pin_hash                text,                   -- scrypt$v=1$N=…$poivre=…$sel$hash (algo 11)
   pin_salt                text,
   mfa_secret              text,
@@ -156,8 +157,8 @@ create table if not exists esim_profile (
   data_quota_mb  integer,
   data_used_mb   integer default 0,
   status         text not null default 'ACTIVE',
-  activated_at   timestamptz,                     -- [optionnel]
-  created_at     timestamptz not null default now()
+  activated_at   timestamptz,                     -- début du forfait : tri et expiration (maintenance)
+  created_at     timestamptz default now()        -- [optionnel]
 );
 
 -- ── Change de devises ───────────────────────────────────────────────

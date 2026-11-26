@@ -42,13 +42,15 @@ const { faux, requerir } = preparer({
   },
   contraintesUniques: { virtual_number: ['did_number'], users: ['phone_number'] }
 })
-const { genererTokens } = requerir('src/algorithms/algo10_zeroTrustJWT')
+const { genererTokens, genererJetonSensible } = requerir('src/algorithms/algo10_zeroTrustJWT')
 
 let app
 let jeton
+let jetonSensible // obtenu en production par POST /api/security/pin/verify
 before(async () => {
   app = await demarrerApp(requerir)
   jeton = (await genererTokens({ userId: U, role: 'USER' })).access_token
+  jetonSensible = genererJetonSensible({ userId: U, role: 'USER', sessionId: 'session-de-test' }).access_token
 })
 after(() => app.arreter())
 
@@ -139,23 +141,29 @@ describe('change de devises', () => {
     const apercu = await app.appel('POST', '/api/currency/preview', { jeton, corps: demande })
     assert.equal(apercu.json.montantBrut, 152.45)
     assert.equal((await app.appel('POST', '/api/currency/preview', { jeton, corps: { ...demande, montant: 'abc' } })).statut, 400)
-    assert.equal((await app.appel('POST', '/api/currency/confirm', { jeton, corps: { ...demande, deviseSource: 'EUR', deviseCible: 'XAF' } })).statut, 400)
+    assert.equal((await app.appel('POST', '/api/currency/confirm', { jeton: jetonSensible, corps: { ...demande, deviseSource: 'EUR', deviseCible: 'XAF' } })).statut, 400)
+  })
+
+  test('confirmation sans PIN confirmé → 401 CONFIRMATION_PIN_REQUISE', async () => {
+    const refus = await app.appel('POST', '/api/currency/confirm', { jeton, corps: demande })
+    assert.deepEqual([refus.statut, refus.json.code], [401, 'CONFIRMATION_PIN_REQUISE'])
+    assert.equal(faux.tables.currency_transaction.length, 0)
   })
 
   test('confirmation idempotente : rejeu identique, corps différent refusé', async () => {
     const entetes = { 'idempotency-key': 'achat-2026-11-19-0001' }
-    const premiere = await app.appel('POST', '/api/currency/confirm', { jeton, entetes, corps: demande })
+    const premiere = await app.appel('POST', '/api/currency/confirm', { jeton: jetonSensible, entetes, corps: demande })
     assert.deepEqual([premiere.statut, premiere.json.controleFraude.statut], [201, 'NORMAL'])
-    const rejeu = await app.appel('POST', '/api/currency/confirm', { jeton, entetes, corps: demande })
+    const rejeu = await app.appel('POST', '/api/currency/confirm', { jeton: jetonSensible, entetes, corps: demande })
     assert.equal(rejeu.entetes.get('idempotent-replayed'), 'true')
     assert.equal(rejeu.json.transaction.transaction_id, premiere.json.transaction.transaction_id)
     assert.equal(faux.tables.currency_transaction.length, 1)
-    assert.equal((await app.appel('POST', '/api/currency/confirm', { jeton, entetes, corps: { ...demande, montant: 200000 } })).statut, 422)
+    assert.equal((await app.appel('POST', '/api/currency/confirm', { jeton: jetonSensible, entetes, corps: { ...demande, montant: 200000 } })).statut, 422)
   })
 
   test('anti-fraude : montant anormal bloqué, aucune transaction créée', async () => {
     faux.tables.fraud_profile[0].avg_transaction_amount = 1000
-    const bloquee = await app.appel('POST', '/api/currency/confirm', { jeton, corps: { ...demande, montant: 900000 } })
+    const bloquee = await app.appel('POST', '/api/currency/confirm', { jeton: jetonSensible, corps: { ...demande, montant: 900000 } })
     assert.equal(bloquee.statut, 403)
     assert.equal(faux.tables.currency_transaction.length, 1)
   })
@@ -173,6 +181,8 @@ describe('eSIM, déclarations et prédiction', () => {
     const esim = await app.appel('POST', '/api/esim/provision', { jeton, corps: { numberId: NFR, paysISO: 'FR', plan: 'month' } })
     assert.equal(esim.statut, 201)
     assert.match(esim.json.esim.iccid, /^8933\d{15}$/)
+    const echeance = Date.parse(esim.json.esim.expire_le) - Date.parse(esim.json.esim.activated_at)
+    assert.equal(Math.round(echeance / 86400000), 30) // forfait MONTH
     assert.equal((await app.appel('POST', '/api/esim/provision', { jeton, corps: { numberId: NFR, paysISO: 'FR' } })).statut, 200)
     assert.equal((await app.appel('POST', '/api/esim/provision', { jeton, corps: { numberId: NJP, paysISO: 'JP' } })).statut, 503)
   })

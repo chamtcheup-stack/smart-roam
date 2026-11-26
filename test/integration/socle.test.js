@@ -58,6 +58,41 @@ describe('erreurs au format JSON', () => {
   })
 })
 
+describe('traçage des requêtes', () => {
+  test('identifiant de requête généré, ou repris s\'il est valide', async () => {
+    const genere = await app.appel('GET', '/api/health')
+    assert.match(genere.entetes.get('x-request-id'), /^[0-9a-f-]{36}$/)
+    const repris = await app.appel('GET', '/api/health', { entetes: { 'x-request-id': 'proxy-1234-abcd' } })
+    assert.equal(repris.entetes.get('x-request-id'), 'proxy-1234-abcd')
+    const invalide = await app.appel('GET', '/api/health', { entetes: { 'x-request-id': '<script>' } })
+    assert.notEqual(invalide.entetes.get('x-request-id'), '<script>')
+  })
+
+  test('la référence d\'une erreur 500 est l\'identifiant de requête', async () => {
+    faux.forcerErreur('users', { code: 'XX000', message: 'panne' })
+    const reponse = await app.appel('POST', '/api/users/register', {
+      entetes: { 'x-request-id': 'requete-erreur-0001' },
+      corps: { phoneNumber: '+237699111333', countryResidence: 'CM' }
+    })
+    faux.retirerErreur('users')
+    assert.deepEqual([reponse.statut, reponse.json.reference], [500, 'requete-erreur-0001'])
+  })
+
+  test('spécification OpenAPI servie hors production', async () => {
+    const reponse = await fetch(`${app.base}/api/docs/openapi.yaml`)
+    assert.equal(reponse.status, 200)
+    assert.match(await reponse.text(), /^openapi: 3\.1\.0/)
+  })
+
+  test('base trop lente → 503 explicite', async () => {
+    faux.forcerErreur('users', { code: '', message: 'AbortError: Délai de 8000 ms dépassé' })
+    const reponse = await app.appel('POST', '/api/users/register', { corps: { phoneNumber: '+237699111444', countryResidence: 'CM' } })
+    faux.retirerErreur('users')
+    assert.equal(reponse.statut, 503)
+    assert.match(reponse.json.erreur, /momentanément indisponible/)
+  })
+})
+
 describe('durcissement HTTP', () => {
   test('en-têtes de sécurité, pas de x-powered-by, pas de cache', async () => {
     const { entetes } = await app.appel('GET', '/api/health')

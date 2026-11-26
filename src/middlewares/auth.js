@@ -53,6 +53,15 @@ const exigerRole = (...roles) => (req, res, next) => {
   return next()
 }
 
+// Opération sensible (conversion, suppression de compte…) : un utilisateur doit
+// présenter le jeton sensible obtenu en confirmant son PIN (5 minutes).
+const exigerOperationSensible = (req, res, next) => {
+  if (estPrivilegie(req.auth) || (req.auth && req.auth.sensible)) return next()
+  throw nonAuthentifie('Confirmation par PIN requise : POST /api/security/pin/verify puis réessayez avec le jeton sensible', {
+    code: 'CONFIRMATION_PIN_REQUISE'
+  })
+}
+
 // Détermine le compte ciblé par la requête à partir d'un userId fourni
 // (corps ou paramètre) : un utilisateur ne peut cibler que lui-même.
 const resoudreUtilisateurCible = (req, userIdFourni, champ = 'userId') => {
@@ -115,6 +124,7 @@ module.exports = {
   ROLES,
   authentifier,
   exigerRole,
+  exigerOperationSensible,
   exigerProprietaireParam,
   exigerProprietaireCorps,
   exigerProprietaireRessource,

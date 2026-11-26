@@ -10,7 +10,7 @@ const REGLE_AUTRE = 'c0000000-0000-4000-8000-000000000003'
 // TRUST_PROXY : chaque test présente sa propre IP (X-Forwarded-For),
 // les limiteurs par adresse restent indépendants d'un test à l'autre.
 const { faux, requerir } = preparer({
-  env: { TRUST_PROXY: 'true' },
+  env: { TRUST_PROXY: 'true', LIMITE_ECHECS_CONNEXION_IP_15MIN: '8' },
   tables: {
     country: [{ country_iso: 'CM', name_fr: 'Cameroun', data_region: 'af-south-1', did_enabled: true }],
     users: [
@@ -18,6 +18,7 @@ const { faux, requerir } = preparer({
       { user_id: AUTRE, phone_number: '+33600000002', country_of_residence: 'FR', kyc_status: 'PENDING' }
     ],
     session: [],
+    device: [],
     fraud_profile: [],
     audit_log: [],
     forwarding_rule: [{ rule_id: REGLE_AUTRE, user_id: AUTRE, number_id: null, trigger_condition: 'ALWAYS', action: 'RING', is_active: true, priority: 1 }],
@@ -25,7 +26,7 @@ const { faux, requerir } = preparer({
   },
   contraintesUniques: { users: ['phone_number'] }
 })
-const { genererTokens } = requerir('src/algorithms/algo10_zeroTrustJWT')
+const { genererTokens, verifierToken } = requerir('src/algorithms/algo10_zeroTrustJWT')
 
 let app
 let ipSuivante = 10
@@ -117,13 +118,44 @@ describe('connexion et cycle de vie des jetons', () => {
     assert.ok(actions.includes('CONNEXION_ECHOUEE') && actions.includes('COMPTE_VERROUILLE') && actions.includes('CONNEXION_REUSSIE'))
   })
 
-  test('limitation de débit par IP sur /login (10 par 15 min)', async () => {
+  test('IP partagée (CGNAT) : seuls les échecs sont comptés, les réussites restent possibles', async () => {
     nouvelleIP()
-    const reponses = []
-    for (let i = 0; i < 11; i++) reponses.push(await connexion('1357', `+2376990000${10 + i}`))
-    assert.equal(reponses[9].statut, 401)
-    assert.equal(reponses[10].statut, 429)
-    assert.equal(reponses[10].entetes.get('ratelimit-remaining'), '0')
+    for (let i = 0; i < 3; i++) assert.equal((await connexion()).statut, 200)
+    const echecs = []
+    for (let i = 0; i < 9; i++) echecs.push(await connexion('1357', `+2376990000${10 + i}`))
+    assert.equal(echecs[7].statut, 401) // 8 échecs, sur 8 comptes différents
+    assert.equal(echecs[8].statut, 429) // seuil d'échecs de cette IP atteint
+    assert.match(echecs[8].json.erreur, /échecs de connexion depuis cette adresse/)
+    nouvelleIP()
+    assert.equal((await connexion()).statut, 200) // une autre IP n'est pas affectée
+  })
+
+  test('appareil enregistré à la connexion : nouveau, puis connu (règle anti-fraude DEVICE)', async () => {
+    nouvelleIP()
+    const appel = () => app.appel('POST', '/api/auth/login', depuis({ corps: { phoneNumber: TELEPHONE, pin: '4821', deviceId: 'pixel-neuf' } }))
+    assert.equal(verifierToken((await appel()).json.tokens.access_token).appareilConnu, false)
+    assert.equal(verifierToken((await appel()).json.tokens.access_token).appareilConnu, true)
+    assert.ok(faux.tables.device.some((ligne) => ligne.user_id === moi && ligne.device_id === 'pixel-neuf'))
+  })
+
+  test('verrou progressif partagé entre vérification du PIN et connexion ; déverrouillage administrateur', async () => {
+    nouvelleIP()
+    const admin = (await genererTokens({ userId: ADMIN_ID, role: 'ADMIN' })).access_token
+    const deverrouillage = await app.appel('POST', '/api/security/pin/unlock', depuis({ jeton: admin, corps: { userId: AUTRE } }))
+    assert.equal(deverrouillage.json.etaitVerrouille, true) // verrouillé par le test précédent
+
+    const jetonAutre = (await genererTokens({ userId: AUTRE, role: 'USER' })).access_token
+    for (let i = 0; i < 3; i++) {
+      const verification = await app.appel('POST', '/api/security/pin/verify', depuis({ jeton: jetonAutre, corps: { pin: '1357' } }))
+      assert.equal(verification.json.valide, false)
+    }
+    assert.equal((await connexion('1357', '+33600000002')).statut, 401)
+    assert.equal((await connexion('1357', '+33600000002')).statut, 429) // 3 + 2 échecs cumulés
+
+    const utilisateurRefuse = await app.appel('POST', '/api/security/pin/unlock', depuis({ jeton: jetonAutre, corps: { userId: AUTRE } }))
+    assert.equal(utilisateurRefuse.statut, 403)
+    assert.equal((await app.appel('POST', '/api/security/pin/unlock', depuis({ cle: CLE_SERVICE, corps: { userId: AUTRE } }))).json.etaitVerrouille, true)
+    assert.equal((await connexion('1357', '+33600000002')).statut, 401) // de nouveau autorisé à essayer
   })
 
   test('changement de PIN valide → anciennes sessions révoquées', async () => {
@@ -178,10 +210,19 @@ describe('autorisations (IDOR et rôles)', () => {
     assert.equal((await app.appel('GET', '/api/health', depuis())).statut, 200)
   })
 
-  test('suppression du compte : sessions révoquées, profil introuvable', async () => {
+  test('suppression du compte : confirmation par PIN exigée, sessions révoquées', async () => {
     nouvelleIP()
-    const jetonSuppression = (await genererTokens({ userId: moi, role: 'USER' })).access_token
-    assert.equal((await app.appel('DELETE', `/api/users/${moi}`, depuis({ jeton: jetonSuppression }))).statut, 200)
+    const { json } = await connexion('5937')
+    const jetonSuppression = json.tokens.access_token
+    const sansPIN = await app.appel('DELETE', `/api/users/${moi}`, depuis({ jeton: jetonSuppression }))
+    assert.deepEqual([sansPIN.statut, sansPIN.json.code], [401, 'CONFIRMATION_PIN_REQUISE'])
+
+    const verification = await app.appel('POST', '/api/security/pin/verify', depuis({ jeton: jetonSuppression, corps: { pin: '5937' } }))
+    const sensible = verification.json.jetonSensible
+    assert.equal(sensible.expires_in, 300)
+    assert.equal(verifierToken(sensible.access_token).sensible, true)
+
+    assert.equal((await app.appel('DELETE', `/api/users/${moi}`, depuis({ jeton: sensible.access_token }))).statut, 200)
     assert.equal((await app.appel('GET', `/api/users/${moi}`, depuis({ jeton: jetonSuppression }))).statut, 401)
     const admin = (await genererTokens({ userId: ADMIN_ID, role: 'ADMIN' })).access_token
     assert.equal((await app.appel('GET', `/api/users/${moi}`, depuis({ jeton: admin }))).statut, 404)

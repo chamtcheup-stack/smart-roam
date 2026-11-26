@@ -5,7 +5,7 @@ const v = require('../utils/validation')
 const logger = require('../utils/logger')
 const { introuvable, requeteInvalide, interdit, tropDeRequetes } = require('../utils/http')
 const { donnees } = require('../utils/db')
-const { VerrouTentatives } = require('../utils/limiteur')
+const { verrouCompte, cleCompte, cleTelephone } = require('../utils/verrouCompte')
 const { auditerRequete } = require('../utils/audit')
 const { estPrivilegie } = require('../middlewares/auth')
 const {
@@ -14,18 +14,10 @@ const {
   verifierPINUtilisateur,
   estPINTrivial
 } = require('../algorithms/algo11_hachagePIN')
-const { revoquerTousTokens } = require('../algorithms/algo10_zeroTrustJWT')
+const { revoquerTousTokens, genererJetonSensible } = require('../algorithms/algo10_zeroTrustJWT')
 const { evaluerRequeteWAF } = require('../algorithms/algo13_detectionWAF')
 
-const QUINZE_MINUTES = 15 * 60 * 1000
-
-// 5 échecs en 15 minutes → PIN verrouillé 15 minutes pour ce compte.
-const verrouPIN = new VerrouTentatives({
-  maxEchecs: 5,
-  fenetreMs: QUINZE_MINUTES,
-  dureeBlocageMs: QUINZE_MINUTES
-})
-
+// Verrou progressif partagé avec la connexion (utils/verrouCompte).
 const MESSAGE_VERROUILLE = 'Trop de tentatives : PIN temporairement verrouillé'
 
 const chargerUtilisateurActif = async (userId) => {
@@ -37,7 +29,7 @@ const chargerUtilisateurActif = async (userId) => {
 }
 
 const verifierNonVerrouille = (userId) => {
-  const verrou = verrouPIN.etat(userId)
+  const verrou = verrouCompte.etat(cleCompte(userId))
   if (verrou.bloque) throw tropDeRequetes(MESSAGE_VERROUILLE, verrou.reessayerDansSecondes)
 }
 
@@ -45,10 +37,10 @@ const verifierNonVerrouille = (userId) => {
 const controlerPIN = async (req, utilisateur, userId, pin) => {
   const { valide } = await verifierPINUtilisateur(utilisateur, pin)
   if (valide) {
-    verrouPIN.reinitialiser(userId)
+    verrouCompte.reinitialiser(cleCompte(userId))
     return { valide: true, echecsRestants: null }
   }
-  const echec = verrouPIN.enregistrerEchec(userId)
+  const echec = verrouCompte.enregistrerEchec(cleCompte(userId))
   if (echec.bloque) {
     void auditerRequete(req, { userId, entite: 'SECURITY', action: 'PIN_VERROUILLE' })
     throw tropDeRequetes(MESSAGE_VERROUILLE, echec.reessayerDansSecondes)
@@ -129,7 +121,40 @@ const verifierPIN = async (req, res) => {
       tentativesRestantes: controle.echecsRestants
     })
   }
-  return res.status(200).json({ valide: true, message: 'PIN correct' })
+  // PIN confirmé : jeton d'opération sensible (5 min) pour la session courante,
+  // exigé par les conversions et la suppression du compte.
+  const reponse = { valide: true, message: 'PIN correct' }
+  if (req.auth && req.auth.sessionId && String(req.auth.userId) === String(userId)) {
+    reponse.jetonSensible = genererJetonSensible({
+      userId,
+      role: req.auth.role,
+      deviceId: req.auth.deviceId,
+      sessionId: req.auth.sessionId,
+      appareilConnu: req.auth.appareilConnu
+    })
+  }
+  return res.status(200).json(reponse)
+}
+
+// ════════════════════════════════════════════
+// POST /api/security/pin/unlock   (ADMIN / SERVICE)
+// Lever le verrouillage anti-force brute d'un compte, après vérification
+// de l'identité du titulaire par le support.
+// ════════════════════════════════════════════
+const deverrouillerCompte = async (req, res) => {
+  const userId = v.identifiant(req.body.userId, 'userId')
+  const utilisateur = await chargerUtilisateurActif(userId)
+  if (!utilisateur) throw introuvable('Utilisateur introuvable')
+
+  const etat = verrouCompte.etat(cleCompte(userId))
+  verrouCompte.reinitialiser(cleCompte(userId))
+  verrouCompte.reinitialiser(cleTelephone(utilisateur.phone_number))
+  void auditerRequete(req, { userId, entite: 'SECURITY', action: 'COMPTE_DEVERROUILLE' })
+
+  return res.status(200).json({
+    message: etat.bloque ? 'Compte déverrouillé' : "Le compte n'était pas verrouillé (compteurs remis à zéro)",
+    etaitVerrouille: etat.bloque
+  })
 }
 
 // ════════════════════════════════════════════
@@ -154,6 +179,6 @@ const analyserRequeteWAF = async (req, res) => {
 module.exports = {
   creerPIN,
   verifierPIN,
-  analyserRequeteWAF,
-  verrouPIN
+  deverrouillerCompte,
+  analyserRequeteWAF
 }

@@ -54,7 +54,9 @@ const comparer = (a, b) => {
 
 const vers = (valeur) => (valeur instanceof Date ? valeur.toISOString() : valeur)
 
-const creerFauxSupabase = (tablesInitiales = {}, { contraintesUniques = {} } = {}) => {
+// schemas (facultatif) : { table: [colonnes] } → une sélection de colonne
+// inconnue renvoie l'erreur PostgreSQL 42703, comme PostgREST.
+const creerFauxSupabase = (tablesInitiales = {}, { contraintesUniques = {}, schemas = {} } = {}) => {
   const tables = {}
   const erreursForcees = new Map()
   const journal = []
@@ -95,11 +97,16 @@ const creerFauxSupabase = (tablesInitiales = {}, { contraintesUniques = {} } = {
       this.plage = null
       this.valeurs = null
       this.optionsUpsert = {}
+      this.colonnesUtilisees = new Set() // filtres et tris
     }
 
     select (colonnes = '*', options = {}) {
-      if (this.operation === 'select') this.optionsSelect = options
-      else this.retourLignes = true
+      if (this.operation === 'select') {
+        this.optionsSelect = options
+        this.colonnesDemandees = colonnes
+      } else {
+        this.retourLignes = true
+      }
       return this
     }
 
@@ -108,15 +115,16 @@ const creerFauxSupabase = (tablesInitiales = {}, { contraintesUniques = {} } = {
     update (patch) { this.operation = 'update'; this.valeurs = patch; return this }
     delete () { this.operation = 'delete'; return this }
 
-    eq (c, v) { this.filtres.push((l) => egal(l[c], v)); return this }
-    neq (c, v) { this.filtres.push((l) => !egal(l[c], v)); return this }
-    gt (c, v) { this.filtres.push((l) => l[c] != null && comparer(l[c], vers(v)) > 0); return this }
-    gte (c, v) { this.filtres.push((l) => l[c] != null && comparer(l[c], vers(v)) >= 0); return this }
-    lt (c, v) { this.filtres.push((l) => l[c] != null && comparer(l[c], vers(v)) < 0); return this }
-    lte (c, v) { this.filtres.push((l) => l[c] != null && comparer(l[c], vers(v)) <= 0); return this }
-    in (c, valeurs) { this.filtres.push((l) => valeurs.some((v) => egal(l[c], v))); return this }
-    is (c, v) { this.filtres.push((l) => (v === null ? l[c] == null : l[c] === v)); return this }
+    eq (c, v) { this.colonnesUtilisees.add(c); this.filtres.push((l) => egal(l[c], v)); return this }
+    neq (c, v) { this.colonnesUtilisees.add(c); this.filtres.push((l) => !egal(l[c], v)); return this }
+    gt (c, v) { this.colonnesUtilisees.add(c); this.filtres.push((l) => l[c] != null && comparer(l[c], vers(v)) > 0); return this }
+    gte (c, v) { this.colonnesUtilisees.add(c); this.filtres.push((l) => l[c] != null && comparer(l[c], vers(v)) >= 0); return this }
+    lt (c, v) { this.colonnesUtilisees.add(c); this.filtres.push((l) => l[c] != null && comparer(l[c], vers(v)) < 0); return this }
+    lte (c, v) { this.colonnesUtilisees.add(c); this.filtres.push((l) => l[c] != null && comparer(l[c], vers(v)) <= 0); return this }
+    in (c, valeurs) { this.colonnesUtilisees.add(c); this.filtres.push((l) => valeurs.some((v) => egal(l[c], v))); return this }
+    is (c, v) { this.colonnesUtilisees.add(c); this.filtres.push((l) => (v === null ? l[c] == null : l[c] === v)); return this }
     not (c, operateur, v) {
+      this.colonnesUtilisees.add(c)
       if (operateur === 'is') this.filtres.push((l) => !(v === null ? l[c] == null : l[c] === v))
       else if (operateur === 'eq') this.filtres.push((l) => !egal(l[c], v))
       else if (operateur === 'in') {
@@ -128,18 +136,20 @@ const creerFauxSupabase = (tablesInitiales = {}, { contraintesUniques = {} } = {
 
     like (c, motif) { return this.ilike(c, motif, false) }
     ilike (c, motif, insensible = true) {
+      this.colonnesUtilisees.add(c)
       const regex = new RegExp(`^${String(motif).replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/%/g, '.*').replace(/_/g, '.')}$`, insensible ? 'i' : '')
       this.filtres.push((l) => l[c] != null && regex.test(String(l[c])))
       return this
     }
 
     or (expression) {
+      for (const partie of expression.split(',')) this.colonnesUtilisees.add(partie.split('.')[0])
       const sousFiltres = expression.split(',').map(filtreDepuisExpression)
       this.filtres.push((l) => sousFiltres.some((f) => f(l)))
       return this
     }
 
-    order (c, { ascending = true } = {}) { this.ordres.push({ c, ascending }); return this }
+    order (c, { ascending = true } = {}) { this.colonnesUtilisees.add(c); this.ordres.push({ c, ascending }); return this }
     limit (n) { this.limite = n; return this }
     range (debut, fin) { this.plage = [debut, fin]; return this }
     single () { this.unique = 'single'; return this }
@@ -177,9 +187,25 @@ const creerFauxSupabase = (tablesInitiales = {}, { contraintesUniques = {} } = {
       return null
     }
 
+    // Erreur PostgREST pour une colonne inconnue du schéma déclaré (si déclaré).
+    verifierColonnes () {
+      const connues = schemas[this.nomTable]
+      if (!connues) return null
+      const inconnue = [...this.colonnesUtilisees].find((c) => !connues.includes(c))
+      if (inconnue) return { code: '42703', message: `column ${this.nomTable}.${inconnue} does not exist` }
+      const ecrites = this.operation === 'update'
+        ? Object.keys(this.valeurs || {})
+        : (this.operation === 'insert' || this.operation === 'upsert') ? this.valeurs.flatMap((ligne) => Object.keys(ligne)) : []
+      const absente = ecrites.find((c) => !connues.includes(c))
+      if (absente) return { code: 'PGRST204', message: `Could not find the '${absente}' column of '${this.nomTable}' in the schema cache` }
+      return null
+    }
+
     executer () {
       journal.push({ table: this.nomTable, operation: this.operation })
       const forcee = erreursForcees.get(this.nomTable)
+      const erreurSchema = !forcee && this.verifierColonnes()
+      if (erreurSchema) return { data: null, error: erreurSchema, count: null }
       if (forcee && (!forcee.operations || forcee.operations.includes(this.operation))) {
         return { data: null, error: { ...forcee.erreur }, count: null }
       }
@@ -187,6 +213,11 @@ const creerFauxSupabase = (tablesInitiales = {}, { contraintesUniques = {} } = {
       const cle = CLES_PRIMAIRES[this.nomTable] || 'id'
 
       if (this.operation === 'select') {
+        const connues = schemas[this.nomTable]
+        if (connues && this.colonnesDemandees && this.colonnesDemandees !== '*') {
+          const inconnue = this.colonnesDemandees.split(',').map((c) => c.trim()).find((c) => c && !connues.includes(c))
+          if (inconnue) return { data: null, error: { code: '42703', message: `column ${this.nomTable}.${inconnue} does not exist` }, count: null }
+        }
         let lignes = this.correspondances()
         for (const { c, ascending } of [...this.ordres].reverse()) {
           lignes = [...lignes].sort((a, b) => comparer(a[c], b[c]) * (ascending ? 1 : -1))
@@ -212,7 +243,8 @@ const creerFauxSupabase = (tablesInitiales = {}, { contraintesUniques = {} } = {
             }
           }
           if (ligne[cle] === undefined) ligne[cle] = crypto.randomUUID()
-          if (ligne.created_at === undefined) ligne.created_at = new Date().toISOString()
+          const avecDate = !schemas[this.nomTable] || schemas[this.nomTable].includes('created_at')
+          if (avecDate && ligne.created_at === undefined) ligne.created_at = new Date().toISOString()
           const erreur = this.verifierUnicite(ligne)
           if (erreur) return { data: null, error: erreur, count: null }
           table(this.nomTable).push(ligne)

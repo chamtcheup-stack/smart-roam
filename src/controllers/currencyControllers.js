@@ -6,6 +6,7 @@ const logger = require('../utils/logger')
 const { interdit } = require('../utils/http')
 const { donnees, paginer } = require('../utils/db')
 const { auditerRequete } = require('../utils/audit')
+const { executerEnExclusion } = require('../utils/exclusion')
 const { preparerConversion, executerTransaction, etatCircuitBreaker } = require('../algorithms/algo17_conversionDevises')
 const { detectionFraudeIA, apprendreTransaction } = require('../algorithms/algo07_detectionFraude')
 
@@ -64,7 +65,22 @@ const previewConversion = async (req, res) => {
 // ════════════════════════════════════════════
 const confirmerConversion = async (req, res) => {
   const userId = v.identifiant(req.body.userId, 'userId')
-  const devis = await preparerConversion(lireDemande(req.body))
+  const demande = lireDemande(req.body)
+
+  // Une conversion à la fois par utilisateur : sinon des confirmations simultanées
+  // passeraient toutes le contrôle anti-fraude avant d'être enregistrées.
+  const { transaction, controle } = await executerEnExclusion(`conversion:${userId}`, () => executerConversion(req, userId, demande))
+
+  void auditerRequete(req, { userId, entite: 'CURRENCY', action: `TRANSACTION_CONFIRMEE_${transaction.transaction_id}` })
+  return res.status(201).json({
+    message: 'Transaction confirmée',
+    transaction,
+    controleFraude: { statut: controle.statut }
+  })
+}
+
+const executerConversion = async (req, userId, demande) => {
+  const devis = await preparerConversion(demande)
 
   // Contrôle anti-fraude (algo 07) sur le montant équivalent en XAF.
   const pays = await determinerPaysTransaction(userId)
@@ -72,7 +88,8 @@ const confirmerConversion = async (req, res) => {
     montant: devis.montantEquivalentXAF,
     devise: 'XAF',
     pays,
-    device_id: req.auth && req.auth.deviceId
+    device_id: req.auth && req.auth.deviceId,
+    appareil_connu: req.auth ? req.auth.appareilConnu : null
   })
   if (controle.statut === 'SUSPENDU') {
     void auditerRequete(req, { userId, entite: 'CURRENCY', action: `TRANSACTION_BLOQUEE_FRAUDE_${controle.typeAnomalie}` })
@@ -86,13 +103,7 @@ const confirmerConversion = async (req, res) => {
       logger.warn('Apprentissage du profil de fraude impossible', erreur)
     })
   }
-  void auditerRequete(req, { userId, entite: 'CURRENCY', action: `TRANSACTION_CONFIRMEE_${transaction.transaction_id}` })
-
-  return res.status(201).json({
-    message: 'Transaction confirmée',
-    transaction,
-    controleFraude: { statut: controle.statut }
-  })
+  return { transaction, controle }
 }
 
 // ════════════════════════════════════════════

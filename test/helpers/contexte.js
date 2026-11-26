@@ -14,7 +14,7 @@ const RACINE = path.resolve(__dirname, '..', '..')
 const CLE_SERVICE = 'cle-service-de-test-suffisamment-longue'
 const ADMIN_ID = 'a0000000-0000-4000-8000-0000000000ad'
 
-const preparer = ({ tables = {}, contraintesUniques = {}, env = {} } = {}) => {
+const preparer = ({ tables = {}, contraintesUniques = {}, schemas = {}, env = {} } = {}) => {
   Object.assign(process.env, {
     NODE_ENV: 'test',
     LOG_LEVEL: 'silent',
@@ -26,7 +26,7 @@ const preparer = ({ tables = {}, contraintesUniques = {}, env = {} } = {}) => {
     PIN_PEPPER: 'poivre-de-test',
     ...env
   })
-  const faux = installerFauxSupabase(RACINE, creerFauxSupabase(tables, { contraintesUniques }))
+  const faux = installerFauxSupabase(RACINE, creerFauxSupabase(tables, { contraintesUniques, schemas }))
   const requerir = (cheminRelatif) => require(path.join(RACINE, cheminRelatif))
   return { faux, requerir }
 }

@@ -7,6 +7,7 @@
 // ════════════════════════════════════════════════════════════
 
 const config = require('../config')
+const { contexteCourant } = require('./contexteRequete')
 
 const NIVEAUX = { silent: -1, error: 0, warn: 1, info: 2, debug: 3 }
 const seuil = NIVEAUX[config.logLevel] ?? NIVEAUX.info
@@ -60,12 +61,34 @@ const serialiser = (contexte) => {
   return String(contexte)
 }
 
+// Une ligne JSON par évènement (LOG_FORMAT=json), pour un outil de supervision.
+const ligneJSON = (horodatage, niveau, message, requestId, contexte) => {
+  const evenement = { horodatage, niveau, message }
+  if (requestId) evenement.requestId = requestId
+  if (contexte instanceof Error) evenement.erreur = formaterErreur(contexte)
+  else if (contexte && typeof contexte === 'object') Object.assign(evenement, nettoyer(contexte))
+  else if (contexte !== undefined) evenement.contexte = String(contexte)
+  try {
+    return JSON.stringify(evenement)
+  } catch {
+    return JSON.stringify({ horodatage, niveau, message, requestId, contexte: '[non sérialisable]' })
+  }
+}
+
 const ecrire = (niveau, message, contexte) => {
   if (NIVEAUX[niveau] > seuil) return
-  const ligne = `${new Date().toISOString()} ${niveau.toUpperCase().padEnd(5)} ${message}`
-  const suffixe = contexte === undefined ? '' : ` ${serialiser(contexte)}`
+  const horodatage = new Date().toISOString()
+  const requestId = (contexteCourant() || {}).requestId || null
+  let ligne
+  if (config.logFormat === 'json') {
+    ligne = ligneJSON(horodatage, niveau, message, requestId, contexte)
+  } else {
+    const prefixe = requestId ? ` [${requestId}]` : ''
+    const suffixe = contexte === undefined ? '' : ` ${serialiser(contexte)}`
+    ligne = `${horodatage} ${niveau.toUpperCase().padEnd(5)}${prefixe} ${message}${suffixe}`
+  }
   const sortie = niveau === 'error' || niveau === 'warn' ? console.error : console.log
-  sortie(ligne + suffixe)
+  sortie(ligne)
 }
 
 module.exports = {

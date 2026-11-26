@@ -46,7 +46,7 @@ const assainirReponses = (req, res, next) => {
     if (!aExpurger) return jsonOriginal(corps)
 
     const { detail, stack: _stack, ...reste } = corps
-    const reference = reste.reference || crypto.randomUUID()
+    const reference = reste.reference || req.id || crypto.randomUUID()
     logger.error(`Détail d'erreur retiré de la réponse [${reference}] ${req.method} ${(req.originalUrl || '').split('?')[0]}`, {
       detail: logger.masquerTexte(typeof detail === 'string' ? detail : JSON.stringify(detail))
     })

@@ -40,7 +40,8 @@ const gestionnaireErreurs = (erreur, req, res, next) => {
     })
   }
 
-  const reference = crypto.randomUUID()
+  // Référence = identifiant de requête : retrouvable dans tous les journaux.
+  const reference = req.id || crypto.randomUUID()
   logger.error(`Erreur interne [${reference}] ${req.method} ${cheminSansRequete(req)}`, erreur)
   return res.status(500).json({ erreur: 'Erreur serveur', reference })
 }

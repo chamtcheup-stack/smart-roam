@@ -83,6 +83,45 @@ const verifierDeviceConnu = async (userId, deviceId, maintenant = new Date()) =>
   return Array.isArray(data) && data.length > 0
 }
 
+// Enregistre l'appareil à la connexion et indique s'il était déjà connu
+// (vu depuis moins de 90 jours) : true / false, ou null si non vérifiable.
+// Ne bloque jamais la connexion (table absente, erreur de base…).
+let tableAppareilsDisponible = true
+const enregistrerAppareil = async (userId, deviceId, maintenant = new Date()) => {
+  if (!deviceId || !tableAppareilsDisponible) return null
+  try {
+    const { data, error } = await supabase
+      .from('device')
+      .select('last_seen_at')
+      .eq('user_id', userId)
+      .eq('device_id', deviceId)
+      .limit(1)
+    if (error) {
+      if (estTableAbsente(error) || estColonneAbsente(error)) {
+        tableAppareilsDisponible = false
+        logger.warn('Table « device » absente ou incomplète : la règle anti-fraude DEVICE est désactivée')
+        return null
+      }
+      throw new ErreurBase('lecture de l\'appareil', error)
+    }
+
+    const existant = Array.isArray(data) ? data[0] : null
+    const limite = maintenant.getTime() - PERIODE_ANALYSE_JOURS * 24 * 60 * 60 * 1000
+    const connu = Boolean(existant && Date.parse(existant.last_seen_at) >= limite)
+    const vuLe = maintenant.toISOString()
+    await executerSansEchec(
+      existant
+        ? supabase.from('device').update({ last_seen_at: vuLe }).eq('user_id', userId).eq('device_id', deviceId)
+        : supabase.from('device').insert([{ user_id: userId, device_id: deviceId, last_seen_at: vuLe }]),
+      'enregistrement de l\'appareil'
+    )
+    return connu
+  } catch (erreur) {
+    logger.warn('Enregistrement de l\'appareil impossible (connexion poursuivie)', erreur)
+    return null
+  }
+}
+
 // typical_countries : tableau de codes ('FR') ou d'objets ({ iso: 'FR' }).
 const paysHabituels = (profil) => (Array.isArray(profil && profil.typical_countries) ? profil.typical_countries : [])
   .map((pays) => (typeof pays === 'string' ? pays : pays && (pays.iso || pays.pays || pays.country_iso)))
@@ -212,7 +251,8 @@ const apprendreTransaction = async (userId, transaction, { maintenant = new Date
 }
 
 // ── Traitement principal ────────────────────────────────────
-// transaction : { montant, devise?, pays?, device_id?, transaction_id? }
+// transaction : { montant, devise?, pays?, device_id?, appareil_connu?, transaction_id? }
+// appareil_connu (issu du jeton de session) évite une requête sur la table device.
 const detectionFraudeIA = async (userId, transaction, { maintenant = new Date() } = {}) => {
   const profil = await recupererProfilNormal(userId)
   if (!profil) {
@@ -223,7 +263,9 @@ const detectionFraudeIA = async (userId, transaction, { maintenant = new Date() 
   const [nbTransactionsHeure, nbTransactions24h, deviceConnu] = await Promise.all([
     compterTransactionsRecentes(userId, 60, maintenant),
     compterTransactionsRecentes(userId, MINUTES_PAR_JOUR, maintenant),
-    verifierDeviceConnu(userId, transaction.device_id, maintenant)
+    typeof transaction.appareil_connu === 'boolean'
+      ? transaction.appareil_connu
+      : verifierDeviceConnu(userId, transaction.device_id, maintenant)
   ])
   const contexte = { nbTransactionsHeure, deviceConnu }
 
@@ -266,6 +308,7 @@ module.exports = {
   evaluerRegleDeterministe,
   calculerScoreML,
   determinerAction,
+  enregistrerAppareil,
   apprendreTransaction,
   detectionFraudeIA
 }
