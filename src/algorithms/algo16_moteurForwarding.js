@@ -1,301 +1,197 @@
-const supabase = require ('../supabase')
+'use strict'
 
+// ════════════════════════════════════════════════════════════
+// ALGO 16 — Moteur de règles de renvoi d'appel (forwarding)
+//
+// Pour un appel entrant sur un numéro virtuel (DID) :
+//   1. DID inconnu ou inactif           → REJECT
+//   2. règles actives du numéro appelé (ou globales, number_id NULL),
+//      par priorité croissante ; la première dont la condition est
+//      remplie s'applique
+//   3. aucune règle applicable          → RING (sonnerie directe)
+// Le moteur retourne la commande SIP que la plateforme de téléphonie
+// exécute (302 vers la destination, 486 pour un rejet).
+// ════════════════════════════════════════════════════════════
 
-const  actionForward    = "FORWARD"    // rediriger
-const  actionVoiceMail  = "VOICEMAIL"  // messagerie
-const  actionReject     = "REJECT"     // rejeter
-const  actionRing       = "RING"       // sonnerie directe
+const supabase = require('../supabase')
+const logger = require('../utils/logger')
+const { donnees } = require('../utils/db')
+const { journaliserAudit } = require('../utils/audit')
+const { variantesTelephone } = require('../utils/validation')
 
-const  conditionAlways     = "ALWAYS"      // toujours
-const  conditionBusy       = "BUSY"        // si occupé
-const  conditionNoAnswer   = "NO_ANSWER"   // si pas de réponse
-const  conditionNever      = "NEVER"       // jamais
+const ACTION_FORWARD = 'FORWARD'
+const ACTION_VOICEMAIL = 'VOICEMAIL'
+const ACTION_REJECT = 'REJECT'
+const ACTION_RING = 'RING'
+const ACTIONS = Object.freeze([ACTION_FORWARD, ACTION_VOICEMAIL, ACTION_REJECT, ACTION_RING])
 
-const  TTLCacheRegles   = 300  // 5 minutes en secondes
-const  codeSIPReject    = "486 Busy Here"
-const  codeSIPForward   = "302 Moved Temporarily"
+const CONDITION_ALWAYS = 'ALWAYS'
+const CONDITION_BUSY = 'BUSY'
+const CONDITION_NO_ANSWER = 'NO_ANSWER'
+const CONDITION_NEVER = 'NEVER'
+const CONDITIONS = Object.freeze([CONDITION_ALWAYS, CONDITION_BUSY, CONDITION_NO_ANSWER, CONDITION_NEVER])
 
-const lireCacheRedis = async (cle) => null; // À implémenter avec un client Redis (ex: ioredis)
-const ecrireCacheRedis = async (cle, valeur, ttl) => {}; 
-const envoyerCommandeSip = (params) => {
-    console.log(`[SIP] Envoi commande ${params.type} pour ${params.appelant} -> ${params.destination || 'N/A'}`);
-};
+const STATUT_LIBRE = 'LIBRE'
+const STATUT_OCCUPE = 'OCCUPE'
+const STATUT_SANS_REPONSE = 'SANS_REPONSE'
+const STATUTS_LIGNE = Object.freeze([STATUT_LIBRE, STATUT_OCCUPE, STATUT_SANS_REPONSE])
 
+const TTL_CACHE_REGLES_MS = 5 * 60 * 1000
+const CODE_SIP_REJECT = '486 Busy Here'
+const CODE_SIP_FORWARD = '302 Moved Temporarily'
 
-const resoudreUserIdDepuisNumero = async (numeroAppele) =>{
-    let resultat;
+// ── Cache des règles (par utilisateur, invalidé à chaque modification) ──
+const cacheRegles = new Map() // userId → { regles, expiration }
 
-    try{
-        const {data, error} = await supabase
-        .from('virtual_number')
-        .select('user_id')
-        .eq('did_number', numeroAppele)
-        .eq('status', "ACTIVE")
-        .maybeSingle()
+const invaliderCacheRegles = (userId) => cacheRegles.delete(String(userId))
 
-        if (error){
-            resultat = null
-        } else {
-            resultat = data
-        }
-        return data.user_id;
-    } catch (error){
-        console.error("Une erreur réseau ou système s'est produit:", error)
-        return null
-    }
-
-    if (resultat != null){
-        return resultat.user_id
-    } else {
-        return null
-    }
+const lireCacheRegles = (userId) => {
+  const entree = cacheRegles.get(String(userId))
+  if (!entree || entree.expiration <= Date.now()) {
+    cacheRegles.delete(String(userId))
+    return null
+  }
+  return entree.regles
 }
 
-
-const chargerRegles = async (userId) =>{
-    let reglesEnCache
-    let reglesEnBase
-
-    reglesEnCache = lireCacheRedis("Regles_" + userId)
-    if (reglsEnCache != null){
-        return reglesEnCache
-    }
-    try{
-        const{data, error} = await supabase
-        .from('forwarding_rule')
-        .select('*')
-        .eq('user_id', userId)
-        .eq('is_active', true)
-        .order('priority', {ascending : true});
-
-    } catch (error){
-        console.log("Une érreur est survenue:", error)
-        return [];
-    }
-
-    if (reglesEnBase != null){
-        await ecrireCashRedis  ({
-            cle    : "REGLES_" + userId,
-            valeur : reglesEnBase,
-            ttl    : TTL_CACHE_REGLES
-        })
-        return reglesEnBase
-    } else {
-        return [];
-    }
+const ecrireCacheRegles = (userId, regles) => {
+  cacheRegles.set(String(userId), { regles, expiration: Date.now() + TTL_CACHE_REGLES_MS })
 }
 
-
-const recupererNumeroVirtuelActif = async (userId) =>{
-    let resultat
-
-    try{
-        const{data, error} = await supabase
-        .from('virtual_number')
-        .select('did_number')
-        .eq('user_id', userId)
-        .eq('status', "ACTIVE")
-        .limit(1)
-        .maybeSingle()
-
-        if (error){
-            resultat = null;
-        } else {
-            resultat = data;
-        }
-        console.log(resultat)
-    } catch (error){
-        console.error("Une erreur réseau ou système est survenue :", error)
-        return null;
-    }
-
-    if (resultat != null){
-        return resultat.did_number
-    } else {
-        return null;
-    }
+// Accepte les variantes usuelles : OCCUPE / BUSY, SANS_REPONSE / Sans_Reponse / NO_ANSWER.
+const normaliserStatutLigne = (statut) => {
+  const texte = String(statut || STATUT_LIBRE).trim().toUpperCase().replace(/[\s-]+/g, '_')
+  if (texte === 'BUSY' || texte === 'OCCUPÉ') return STATUT_OCCUPE
+  if (texte === 'NO_ANSWER' || texte === 'SANS_RÉPONSE') return STATUT_SANS_REPONSE
+  return STATUTS_LIGNE.includes(texte) ? texte : STATUT_LIBRE
 }
 
-
-const evaluerCondition = (cle ,statusLigne) =>{
-    let conditionRemplie
-
-    if (regles.triggger_condition === conditionAlways){
-        conditionRemplie =true 
-    }
-
-    if ((regles.trigger_condition === conditionBusy) && (statusLigne === "OCCUPE")){
-        conditionRemplie = true 
-    }
-
-    if ((regles.trigger_condition === conditionNoAnswer) && (statusLigne === "Sans_Reponse")){
-        conditionRemplie = true 
-    }
-
-    if (regles.trigger_condition === conditionNever){
-        conditionRemplie = false 
-    }
-    return conditionRemplie
+// ── Lectures ────────────────────────────────────────────────
+const resoudreNumeroAppele = async (numeroAppele) => {
+  const numeros = donnees(
+    await supabase
+      .from('virtual_number')
+      .select('number_id, user_id, did_number, status')
+      .in('did_number', variantesTelephone(numeroAppele))
+      .eq('status', 'ACTIVE')
+      .limit(1),
+    'résolution du numéro appelé'
+  )
+  return (numeros && numeros[0]) || null
 }
 
-
-const determinerDestination = (regle, numeroVirtuelActif, userId, numeroAppele) =>{
-    let destination = null
-
-    if (regle.action === actionForward){
-        if (regle.target_number != null){
-            destination = regle.target_number 
-        } else {
-            destination = numeroVirtuelActif
-        }
-    }
-
-    if (regle.action === actionVoiceMail){
-        destination = "VOICEMAIL" + userId
-    }
-
-    if (regle.action === actionReject){
-        destination = null 
-    }
-
-    if (regle.action === actionRing){
-        destination = numeroAppele
-    }
-
-    return destination;
-};
-
-// procédures
-const executerForward = (numeroAppelant, numeroDestination) =>{
-
-    envoyerCommandeSip ({
-        type: CODE_SIP_FORWARD,
-        appelant: numeroAppelant,
-        destination: numeroDestination,
-    });
-
-    console.log("Appel redirigé vers : " + numeroDestination)
-    console.log("Appelant :" + numeroAppelant)
+const chargerReglesUtilisateur = async (userId) => {
+  const enCache = lireCacheRegles(userId)
+  if (enCache) return enCache
+  const regles = donnees(
+    await supabase
+      .from('forwarding_rule')
+      .select('*')
+      .eq('user_id', userId)
+      .eq('is_active', true)
+      .order('priority', { ascending: true }),
+    'chargement des règles de forwarding'
+  ) || []
+  ecrireCacheRegles(userId, regles)
+  return regles
 }
 
-const executerReject = (numeroAppelant =>{
+// Règles du numéro appelé + règles globales (number_id absent).
+const filtrerReglesDuNumero = (regles, numberId) =>
+  regles.filter((regle) => regle.number_id === null || regle.number_id === undefined || String(regle.number_id) === String(numberId))
 
-    envoyerCommandeSip ({
-        type: CODE_SIP_REJECT,
-        appelant: numeroAppelant,
-    })
-
-    console.log("Appel rejété :" + CODE_SIP_REJECT)
-    console.log("Appelant:" + numeroAppelant)
-})
-
-
-const executerVoiceMail =(numeroAppelant, userId) =>{
-
-    encoyerCommandeSip ({
-        type: CODE_SIP_FORWARD,
-        appelant: numeroAppelant,
-        destination: "VOICEMAIL" + userId,
-    })
-
-    console.log("Appel redirigé vers la messagerie vocale")
-    console.log("Utilisateur:" + userId)
+// ── Évaluation ──────────────────────────────────────────────
+const evaluerCondition = (regle, statutLigne) => {
+  switch (regle.trigger_condition) {
+    case CONDITION_ALWAYS: return true
+    case CONDITION_BUSY: return statutLigne === STATUT_OCCUPE
+    case CONDITION_NO_ANSWER: return statutLigne === STATUT_SANS_REPONSE
+    default: return false // NEVER ou condition inconnue
+  }
 }
 
-const journaliserDecision = async (userId, numeroAppelant, numeroAppele, action, numeroDestination) =>{
+const memeNumero = (a, b) => Boolean(a) && Boolean(b) && String(a).replace(/^\+/, '') === String(b).replace(/^\+/, '')
 
-    try{
-        const{data, error} = await supabase
-        .from('audit_log')
-        .insert([
-            {
-                user_id: userId,
-                entity_type: "FORWARDING_RULE",
-                action: "APPEL_" + action + "_VERS_" + numeroDestination,
-                actor_type: "SYSTEM",
-                actived_at: new Date().toISOString(),
-            }
-        ])
-
-        console.log (`Log : ${action} | Appelant : ${numeroAppelant} | Appelé : ${numeroAppele} | Vers : ${numeroDestination}`);
-    } catch (error){
-        console.error("Une erreur est survenue:", error)
-        return null;
-    }
-};
-
-const signalerNumeroInconnu = (numeroAppele) =>{
-    console.log("Numéro DID inconnu ou inactif : " + numeroAppele)
-    console.log("Appel rejeté automatiquement")
+// Destination de la règle, ou undefined si la règle est inapplicable
+// (FORWARD sans cible, ou renvoi vers le numéro appelé lui-même = boucle).
+const determinerDestination = (regle, userId, numeroAppele) => {
+  switch (regle.action) {
+    case ACTION_FORWARD:
+      if (!regle.target_number || memeNumero(regle.target_number, numeroAppele)) return undefined
+      return regle.target_number
+    case ACTION_VOICEMAIL: return `VOICEMAIL_${userId}`
+    case ACTION_REJECT: return null
+    case ACTION_RING: return numeroAppele
+    default: return undefined
+  }
 }
 
-const signalerAucuneRegle = (userId) =>{
-    console.log("Aucune règle active pour : " + userId)
-    console.log("Application règle par défaut : RING")
+const codeSIP = (action) => (action === ACTION_REJECT ? CODE_SIP_REJECT : CODE_SIP_FORWARD)
+
+// Pur : choisit la règle et la destination (testable sans base).
+const choisirRegle = (regles, { statutLigne, userId, numeroAppele }) => {
+  for (const regle of regles) {
+    if (!evaluerCondition(regle, statutLigne)) continue
+    const destination = determinerDestination(regle, userId, numeroAppele)
+    if (destination === undefined) {
+      logger.warn('Règle de forwarding inapplicable ignorée', { ruleId: regle.rule_id, action: regle.action })
+      continue
+    }
+    return { regle, action: regle.action, destination }
+  }
+  return null
 }
 
-// traitement principal
-const moteurRegleForwarding = async (numeroAppele, numeroAppelant, statutLigne) =>{
+const journaliserDecision = (userId, action, destination) => {
+  void journaliserAudit({
+    userId,
+    entite: 'FORWARDING_RULE',
+    action: `APPEL_${action}_VERS_${destination ? logger.masquerTelephone(destination) : 'AUCUNE'}`
+  })
+}
 
-    const userId = await resoudreUserIdDepuisNumero(numeroAppele)
-    if (userId === null){
-        signalerNumeroInconnu(numeroAppele)
-        executerReject(numeroAppelant)
-        return null
-    }
+// ── Traitement principal ────────────────────────────────────
+const moteurRegleForwarding = async (numeroAppele, numeroAppelant, statutLigneBrut) => {
+  const statutLigne = normaliserStatutLigne(statutLigneBrut)
+  const numero = await resoudreNumeroAppele(numeroAppele)
 
-    const regles = await chargerRegles(userId)
-    let action = null;
-    let numeroDestination = null;
+  if (!numero) {
+    logger.info('Numéro DID inconnu ou inactif : appel rejeté', { numeroAppele: logger.masquerTelephone(numeroAppele) })
+    return { decision: ACTION_REJECT, destination: null, codeSIP: CODE_SIP_REJECT, raison: 'NUMERO_INCONNU_OU_INACTIF' }
+  }
 
-    if (regles.length === 0){
-        signalerAucuneRegle(userId)
-        action = actionRing
-        numeroDestination = numeroAppele
-        await journaliserDecision(userId, numeroAppelant, numeroAppele, action, numeroDestination)
-        executerForward(numeroAppelant, numeroDestination)
-        return action
-    }
+  const regles = filtrerReglesDuNumero(await chargerReglesUtilisateur(numero.user_id), numero.number_id)
+  const choix = choisirRegle(regles, { statutLigne, userId: numero.user_id, numeroAppele: numero.did_number })
 
-    const numeroVirtuelActif = await recupererNumeroVirtuelActif(userId)
-    let regleTrouvee = false
-    let i = 0
+  const action = choix ? choix.action : ACTION_RING
+  const destination = choix ? choix.destination : numero.did_number
+  journaliserDecision(numero.user_id, action, destination)
 
-    while (i < regles.length && regleTrouvee === false){
-        const regle = regles[i];
-        
+  return {
+    decision: action,
+    destination,
+    codeSIP: codeSIP(action),
+    raison: choix ? 'REGLE_APPLIQUEE' : (regles.length === 0 ? 'AUCUNE_REGLE' : 'AUCUNE_REGLE_APPLICABLE'),
+    regle: choix ? choix.regle : null,
+    statutLigne,
+    userId: numero.user_id,
+    numberId: numero.number_id
+  }
+}
 
-        if (evaluerCondition(regle, statusLigne) === true){
-            action = regle.action
-            numeroDestination = determinerDestination(regle, numeroVirtuelActif)
-            regleTrouvee = true
-        }
-
-        i++;
-    }
-
-    if (regleTrouvee === false){
-        action = actionRing
-        numeroDestination = numeroAppele
-    }
-
-    await journaliserDecision(userId, numeroAppelant, numeroAppele, action, numeroDestination)
-
-    if (action === actionForward){
-        executerForward(numeroAppelant, numeroDestination)
-    }
-
-    if (action === actionReject){
-        executerRejet(numeroAppelant)
-    }
-
-    if (action === actionVoiceMail){
-        executerVoicemail(numeroAppelant, userId)
-    }
-
-    if (action === actionRing){
-        executerForward(numeroAppelant, numeroAppele)
-    }
-
-    return action;
+module.exports = {
+  ACTIONS,
+  CONDITIONS,
+  STATUTS_LIGNE,
+  ACTION_FORWARD,
+  CODE_SIP_FORWARD,
+  CODE_SIP_REJECT,
+  normaliserStatutLigne,
+  memeNumero,
+  evaluerCondition,
+  determinerDestination,
+  filtrerReglesDuNumero,
+  choisirRegle,
+  invaliderCacheRegles,
+  moteurRegleForwarding
 }

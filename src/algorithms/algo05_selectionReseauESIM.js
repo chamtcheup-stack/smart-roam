@@ -1,414 +1,280 @@
-const supabase = require ('../supabase')
+'use strict'
 
-const maxTentatives = 3
-const poidsCouverture = 0.60
-const poidsLatence = 0.30
-const poidsCout = 0.10
-const delaiProvisioning = 60
-const planDefaut = "WEEK"
+// ════════════════════════════════════════════════════════════
+// ALGO 05 — Sélection du réseau et provisioning eSIM
+//
+//   1. BYOE : le voyageur a déclaré sa propre eSIM → rien à provisionner
+//   2. Roaming UE gratuit (origine et destination en zone EU_FREE)
+//   3. Partenaires MVNO actifs du pays, classés par score :
+//        couverture 60 % · latence 30 % · coût 10 %
+//   4. Provisioning OTA avec bascule (failover) : 3 tentatives maximum,
+//      un partenaire différent à chaque tentative
+//   5. Enregistrement du profil eSIM (ICCID conforme E.118 + clé de Luhn)
+// ════════════════════════════════════════════════════════════
 
-const verifierBYOE = async (userId, numberId) =>{
-    let resultat
+const crypto = require('crypto')
+const supabase = require('../supabase')
+const config = require('../config')
+const logger = require('../utils/logger')
+const {
+  donnees,
+  estColonneAbsente,
+  estTableAbsente,
+  estViolationUnicite,
+  insererAvecColonnesOptionnelles,
+  ErreurBase
+} = require('../utils/db')
 
-    try{
-        const {data, error} = await supabase
-        .from('trip_declaration')
-        .select('*')
-        .eq('user_id', userId)
-        .eq('number_id', numberId)
-        .eq('has_own_esim', true)
-        .in('status', ['PENDING', 'CONFIRMED'])
-        .maybeSingle()
-    } catch (error){
-        console.error("Une erreur réseau ou système est survenue:", error)
-        return 
+const MAX_TENTATIVES = 3
+const POIDS_COUVERTURE = 0.60
+const POIDS_LATENCE = 0.30
+const POIDS_COUT = 0.10
+const DELAI_PROVISIONING_SECONDES = 60
+const PLAN_DEFAUT = 'WEEK'
+const QUOTA_DATA_MO = { DAY: 200, WEEK: 1024, MONTH: 5120 }
+const LONGUEUR_ICCID_SANS_CLE = 18
+const MAX_ESSAIS_ICCID = 3
+
+// Indicatifs téléphoniques (E.164) utilisés comme code pays de l'ICCID.
+const INDICATIFS = Object.freeze({
+  CM: '237', FR: '33', BE: '32', ES: '34', LU: '352', PL: '48', RO: '40', SK: '421', MD: '373',
+  IT: '39', DE: '49', CH: '41', PT: '351', NL: '31', GB: '44', TR: '90', GR: '30',
+  CI: '225', SN: '221', ML: '223', BF: '226', GN: '224', CD: '243', MG: '261', EG: '20',
+  DZ: '213', MA: '212', TN: '216', GA: '241', CG: '242', TD: '235', CF: '236', NE: '227',
+  TG: '228', BJ: '229', LR: '231', SL: '232', GW: '245', BW: '267', MU: '230', GQ: '240',
+  NG: '234', GH: '233', KE: '254', ZA: '27', JO: '962', SA: '966', AE: '971', IL: '972',
+  CN: '86', JP: '81', KR: '82', IN: '91', US: '1', CA: '1', MX: '52', BR: '55'
+})
+const INDICATIF_PAR_DEFAUT = '33' // pays de l'émetteur (Orange France)
+
+// ── ICCID ───────────────────────────────────────────────────
+const calculerCleLuhn = (chiffres) => {
+  let somme = 0
+  let doubler = true
+  for (let i = chiffres.length - 1; i >= 0; i--) {
+    let n = Number(chiffres[i])
+    if (doubler) {
+      n *= 2
+      if (n > 9) n -= 9
     }
-
-    if (resultat != null){
-        return true
-    } else {
-        return false
-    }
+    somme += n
+    doubler = !doubler
+  }
+  return String((10 - (somme % 10)) % 10)
 }
 
-const verifierZoneRoamingGratuit = (paysOrigine, paysDestination) =>{
-    
-    let resultatOrigine
-    let resultatDest
+const verifierLuhn = (numero) => /^\d+$/.test(numero) && calculerCleLuhn(numero.slice(0, -1)) === numero.slice(-1)
 
-    try{
-        const {data, error} = await supabase
-        .from('country')
-        .select('roaming_zone')
-        .eq('country_iso', paysOrigine)
-        .maybeSingle()
+const chiffresAleatoires = (longueur) => Array.from({ length: longueur }, () => crypto.randomInt(0, 10)).join('')
 
-        if (error){
-            throw error
-        }
-
-        const{data, error} = await supabase
-        .from('country')
-        .select('roaming_zone')
-        .eq('country_iso', paysDestination)
-        .maybeSingle()
-
-        if (resultatOrigine === null || resultatDest === null){
-            return false;
-        }
-
-        const zoneOrigine     =resultatOrigine.roaming_zone
-        const zoneDestination =resultatDest.roaming_zone
-
-        if (zoneOrigine === "EU_FREE" && zoneDestination === "EU_FREE"){
-            return true
-        } else {
-            return false
-        }
-    } catch (error){
-        console.error("Une erreur est survenue:", error)
-        return null
-    }
+// 89 (télécom) + indicatif pays + émetteur (2) + aléa cryptographique + clé de Luhn = 19 chiffres.
+const genererICCID = (paysISO, emetteur = config.iccidEmetteur) => {
+  const prefixe = `89${INDICATIFS[paysISO] || INDICATIF_PAR_DEFAUT}${emetteur}`
+  const corps = prefixe + chiffresAleatoires(LONGUEUR_ICCID_SANS_CLE - prefixe.length)
+  return corps + calculerCleLuhn(corps)
 }
 
-const recupererPartenaireActifs = (paysISO) =>{
-    let resultat
-
-    try{
-        const{data, error} = await supabase
-        .from('mvno_partner')
-        .select('*')
-        .eq('country_iso', paysISO)
-        .eq('agreement_status', "ACTIVE")
-        .order('failover_priority', {ascending: true})
-
-        if (error){
-            resultat = []
-        } else {
-            resultat = data
-        }
-    } catch (error){
-        console.error("Une erreur réseau ou système est survenue:", error)
-        return []
-    }
-
-    if (resultat != null){
-        return resultat
-    } else {
-        return []
-    }
+// ── Lectures ────────────────────────────────────────────────
+const verifierBYOE = async (userId, numberId) => {
+  const { data, error } = await supabase
+    .from('trip_declaration')
+    .select('declaration_id')
+    .eq('user_id', userId)
+    .eq('number_id', numberId)
+    .eq('has_own_esim', true)
+    .in('status', ['PENDING', 'CONFIRMED'])
+    .limit(1)
+  if (error) {
+    if (estColonneAbsente(error)) return false // option BYOE non gérée par le schéma
+    throw new ErreurBase('vérification BYOE', error)
+  }
+  return Array.isArray(data) && data.length > 0
 }
 
-const recupererScoreCouverture = (partnerId, paysISO ) =>{
-    let resultat
-    let score 
-
-    try{
-        const{data, error} = await supabase
-        .from('mvno_partner')
-        .select('coverage_score')
-        .eq('partner_id', partnerId)
-        .eq('country_iso', paysISO)
-        .maybeSingle()
-
-        if (resultat != null){
-            score = resultat.coverage_score
-        } else {
-            score = 0.50
-        }
-
-        return score
-    } catch (error){
-        console.error("Une erreur est survenue:", error)
-        return null
-    }
+const recupererPaysOrigine = async (userId) => {
+  const utilisateur = donnees(
+    await supabase.from('users').select('country_of_residence').eq('user_id', userId).maybeSingle(),
+    'lecture du pays d\'origine'
+  )
+  return utilisateur ? utilisateur.country_of_residence : null
 }
 
-
-const recupererLatence  = async (partnerId) =>{
-    
-
-    const latence = await mesusrerLatence(resultat.coverage_score)
-    if (latence >= 1000){
-        return 0
-    }
-    return  (1000 - latence) / 1000
+const verifierZoneRoamingGratuit = async (paysOrigine, paysDestination) => {
+  if (!paysOrigine || !paysDestination) return false
+  const { data, error } = await supabase
+    .from('country')
+    .select('country_iso, roaming_zone')
+    .in('country_iso', [paysOrigine, paysDestination])
+  if (error) {
+    if (estColonneAbsente(error)) return false
+    throw new ErreurBase('lecture des zones de roaming', error)
+  }
+  const zone = (iso) => ((data || []).find((pays) => pays.country_iso === iso) || {}).roaming_zone
+  return zone(paysOrigine) === 'EU_FREE' && zone(paysDestination) === 'EU_FREE'
 }
 
-const recupererScoreCout = async (partnerId ,paysISO) =>{
-    let resultat
-    let scoreNorm
-
-    try{
-        const{data, error} = await supabase
-        .from('mvno_partner')
-        .select('cost_per_day_xaf')
-        .eq('partner_id', partnerId)
-        .eq('country_iso', paysISO)
-        .maybeSingle()
-
-        if (resultat === null){
-            return 0.50
-        }
-
-        const coutXAF = resultat.cost_per_day_xaf
-
-        if (coutXAF >= 5000){
-            return 0
-        }
-        scoreNorm = (5000 - coutXAF) / 5000
-        return scoreNorm
-    } catch (error){
-        console.error("Une erreur est survenue:", error)
-        return null
-        
-    }
+const recupererPartenairesActifs = async (paysISO) => {
+  const { data, error } = await supabase
+    .from('mvno_partner')
+    .select('*')
+    .eq('country_iso', paysISO)
+    .eq('agreement_status', 'ACTIVE')
+    .order('failover_priority', { ascending: true })
+  if (error) {
+    if (estTableAbsente(error)) return []
+    throw new ErreurBase('lecture des partenaires MVNO', error)
+  }
+  return data || []
 }
 
-const calculerScorePartenaire = (scoreCouverture, scoreLatence, scoreCout) =>{
-    let scoreTotal
+// ── Scoring des partenaires (à partir de leur ligne, sans requête N+1) ──
+const borner = (valeur) => Math.max(0, Math.min(1, valeur))
 
-    scoreTotal = (scoreCouverture * POIDS_COUVERTURE) + (scoreLatence * POIDS_LATENCE)  + (scoreCout * POIDS_COUT)
-    return scoreTotal;
-
-
+const calculerScoreCouverture = (partenaire) => {
+  const brut = Number(partenaire.coverage_score)
+  if (!Number.isFinite(brut)) return 0.5
+  return borner(brut > 1 ? brut / 100 : brut) // accepte 0–1 ou 0–100
 }
 
-const trouverMeilleurPartenaire = (partenaireScore) =>{
-    let meilleure
-    let scoreMax
-    let i 
-
-    if (partenaireScore.length === 0){
-        return null
-    }
-
-    meilleur = partenaireScores[0]
-    scoreMax = partenaireScores[0].score
-    i        = 1
-
-    while (i < partenaireScore.length){
-        if (partenaireScores[i].score > scoreMax){
-            meilleur = partenaireScores[i]
-            scoreMax = partenaireScores[i].score
-        }
-        i++
-    }
-    return meilleur
+const calculerScoreLatence = (partenaire) => {
+  const latenceMs = Number(partenaire.latency_ms)
+  if (!Number.isFinite(latenceMs)) return 0.5 // pas de mesure disponible : neutre
+  return latenceMs >= 1000 ? 0 : (1000 - latenceMs) / 1000
 }
 
-const cryptoRandomDigits = (length) => {
-    let result = '';
-    for (let i = 0; i < length; i++) {
-        result += Math.floor(Math.random() * 10);
-    }
-    return result;
-};
-
-const genererICCID = (partnerId, paysISO) =>{
-    let iccid 
-
-    iccid = genererICCIDUnique({
-        prefix: "8930" + paysISO,
-        partnerId: partnerId,
-        aleatoire: cryptoRandomDigits(10)
-    })
-    return `${prefix}${partnerId.slice(0, 4)}${aleatoire}`.slice(0, 22);
+const calculerScoreCout = (partenaire) => {
+  const coutXAF = Number(partenaire.cost_per_day_xaf)
+  if (!Number.isFinite(coutXAF)) return 0.5
+  return coutXAF >= 5000 ? 0 : (5000 - coutXAF) / 5000
 }
 
-const appelerSMDPPlus = async (url, iccid, userId, timeoutSec) => {
-    // Simulation d'un appel API vers le SM-DP+ distant
-    return { statut: "SUCCESS" };
-};
+const calculerScorePartenaire = (scoreCouverture, scoreLatence, scoreCout) =>
+  scoreCouverture * POIDS_COUVERTURE + scoreLatence * POIDS_LATENCE + scoreCout * POIDS_COUT
 
-const provisionnerOTA = async (parSemaine, iccid, userId) =>{
-    let reponse 
-    try {
-        const reponse = await appelerSNDPPlus({
-            url: partenaire.esim_sm_dp_url,
-            iccid: iccid,
-            userId: userId,
-            timeout: delaiProvisioningSecondes,
-        })
-    } catch (error){
-        console.error("Erreur lors du provisioning OTA :", error)
-        return false 
-    }
-    if (reponse.status === "SUCCESS"){
-        return true
-    }else{
-        return false
-    }
+const classerPartenaires = (partenaires) => partenaires
+  .map((partenaire) => ({
+    partenaire,
+    score: calculerScorePartenaire(calculerScoreCouverture(partenaire), calculerScoreLatence(partenaire), calculerScoreCout(partenaire))
+  }))
+  .sort((a, b) => b.score - a.score || (a.partenaire.failover_priority ?? 0) - (b.partenaire.failover_priority ?? 0))
+
+// ── Provisioning OTA ────────────────────────────────────────
+// Intégration SM-DP+ (GSMA SGP.22, interface ES2+) à brancher : en
+// attendant, simulation explicite (aucun profil réel téléchargé).
+let simulationSignalee = false
+const appelerSMDPPlus = async ({ url }) => {
+  if (!simulationSignalee) {
+    simulationSignalee = true
+    logger.warn('SM-DP+ simulé : aucun profil eSIM réel n\'est téléchargé (intégration ES2+ à brancher)', { url: url || null })
+  }
+  return { statut: 'SUCCESS', simulation: true }
 }
 
-// procédures
-const enregistrerESIM = async (userId, numberId, partnerId, iccid, paysISO, planChoisi) =>{
-
-    try{
-        const{data, error} = await supabase
-        .from('esim_profile')
-        .insert([
-            {
-                user_id: userId,
-                number_id: numberId,
-                iccid: iccid,
-                provider_id: partnerId,
-                country_iso: paysISO,
-                plan_type: planChoisi,
-                data_quota_mb: 1024,
-                data_used_mb: 0,
-                status: "ACTIVE",
-                activated_at: new Date().toISOString()
-            }
-        ])
-        console.log("eSIM enregistrée en base")
-        console.log("ICCID : " + iccid)
-        console.log("Plan  : " + planChoisi)
-    } catch (error){
-        console.error("Une erreur réseau ou système est survenue:", error)
-        return null
-    }
+const provisionnerOTA = async (partenaire, iccid, userId, fournisseur = appelerSMDPPlus) => {
+  let minuterie
+  const delai = new Promise((resolve) => {
+    minuterie = setTimeout(() => resolve({ statut: 'TIMEOUT' }), DELAI_PROVISIONING_SECONDES * 1000)
+  })
+  try {
+    const reponse = await Promise.race([
+      fournisseur({ url: partenaire.esim_sm_dp_url, iccid, userId, partenaire }),
+      delai
+    ])
+    return Boolean(reponse) && reponse.statut === 'SUCCESS'
+  } catch (erreur) {
+    logger.warn('Échec du provisioning OTA', { partenaire: partenaire.name, message: erreur.message })
+    return false
+  } finally {
+    clearTimeout(minuterie)
+  }
 }
 
-const enregistrerBYOE = async (userId, numberId, paysISO) =>{
-
-    try {
-        const {data, error} = await supabase
-        .from('esim_profile')
-        .insert([
-            {
-                user_id: userId,
-                number_id: numberId,
-                country_iso: paysISO,
-                plan_type: "BYOE",
-                status: "ACTIVE",
-                activated_at: new Date().toISOString(),
-            }
-        ])
-        console.log("Mode BYOE enregistré")
-        console.log("L'utilisateur utilise sa propre eSIM")
-    } catch (error){
-        console.error("Une erreur réseau ou système est survenue:", error)
-        return null
-    }
+// ── Enregistrements ─────────────────────────────────────────
+// L'ICCID provisionné est enregistré tel quel ; en cas de collision (aléa
+// sur 10^11 valeurs), un nouvel ICCID est tiré.
+const enregistrerESIM = async ({ userId, numberId, partenaire, paysISO, plan, iccid: iccidProvisionne }) => {
+  for (let essai = 1; essai <= MAX_ESSAIS_ICCID; essai++) {
+    const iccid = essai === 1 && iccidProvisionne ? iccidProvisionne : genererICCID(paysISO)
+    const { data, error } = await insererAvecColonnesOptionnelles(supabase, 'esim_profile', {
+      user_id: userId,
+      number_id: numberId,
+      iccid,
+      provider_id: partenaire ? partenaire.partner_id : null,
+      country_iso: paysISO,
+      plan_type: plan,
+      data_quota_mb: QUOTA_DATA_MO[plan] || QUOTA_DATA_MO[PLAN_DEFAUT],
+      data_used_mb: 0,
+      status: 'ACTIVE',
+      activated_at: new Date().toISOString()
+    }, ['provider_id', 'activated_at'])
+    if (!error) return data
+    if (!estViolationUnicite(error)) throw new ErreurBase('enregistrement de l\'eSIM', error)
+    logger.warn('Collision d\'ICCID : nouvel essai', { essai })
+  }
+  throw new ErreurBase('enregistrement de l\'eSIM', { message: 'ICCID unique introuvable' })
 }
 
-const notifierProvisionningReussi = (userId, partenaire, iccid) =>{
-    
-    console.log("══════════════════════════════════════")
-    console.log("eSIM PROVISIONNÉE AVEC SUCCÈS")
-    console.log("══════════════════════════════════════")
-    console.log("Utilisateur : " + userId)
-    console.log("Opérateur   : " + partenaire.name)
-    console.log("ICCID       : " + iccid)
-    console.log("Délai       : < " + DELAI_PROVISIONING + "s")
-    console.log("══════════════════════════════════════")
+const enregistrerBYOE = async (userId, numberId, paysISO) => {
+  const { data, error } = await insererAvecColonnesOptionnelles(supabase, 'esim_profile', {
+    user_id: userId,
+    number_id: numberId,
+    country_iso: paysISO,
+    plan_type: 'BYOE',
+    status: 'ACTIVE',
+    activated_at: new Date().toISOString()
+  }, ['activated_at'])
+  if (error) throw new ErreurBase('enregistrement BYOE', error)
+  return data
 }
 
-const notifierRoamingGratuit = (paysOrigine, paysDestination) =>{
+// ── Traitement principal ────────────────────────────────────
+const selectionReseauEsim = async ({ userId, numberId, paysISO, plan = PLAN_DEFAUT }, { fournisseur } = {}) => {
+  if (await verifierBYOE(userId, numberId)) {
+    const esim = await enregistrerBYOE(userId, numberId, paysISO)
+    logger.info('Mode BYOE : pas de provisioning', { userId, paysISO })
+    return { statut: 'BYOE', iccid: null, esim }
+  }
 
-    console.log("══════════════════════════════════════")
-    console.log("ROAMING DATA GRATUIT")
-    console.log("══════════════════════════════════════")
-    console.log("Déplacement intra-UE détecté")
-    console.log("Pays origine      : " + paysOrigine)
-    console.log("Pays destination  : " + paysDestination)
-    console.log("Règlement UE 2017 : roaming data inclus")
-    console.log("Aucune eSIM locale nécessaire")
-    console.log("══════════════════════════════════════")
+  const paysOrigine = await recupererPaysOrigine(userId)
+  if (await verifierZoneRoamingGratuit(paysOrigine, paysISO)) {
+    logger.info('Roaming UE gratuit : aucune eSIM locale nécessaire', { paysOrigine, paysISO })
+    return { statut: 'ROAMING_GRATUIT', iccid: null }
+  }
+
+  const partenaires = classerPartenaires(await recupererPartenairesActifs(paysISO))
+  if (partenaires.length === 0) {
+    logger.warn('Aucun partenaire MVNO actif', { paysISO })
+    return { statut: 'AUCUN_PARTENAIRE', iccid: null }
+  }
+
+  const tentatives = []
+  for (const { partenaire, score } of partenaires.slice(0, MAX_TENTATIVES)) {
+    const iccid = genererICCID(paysISO)
+    const reussi = await provisionnerOTA(partenaire, iccid, userId, fournisseur)
+    tentatives.push({ partenaire: partenaire.name, score: Number(score.toFixed(3)), reussi })
+    if (reussi) {
+      const esim = await enregistrerESIM({ userId, numberId, partenaire, paysISO, plan, iccid })
+      logger.info('eSIM provisionnée', { userId, partenaire: partenaire.name })
+      return { statut: 'SUCCES', iccid: esim.iccid, partenaire: partenaire.name, plan, esim, tentatives }
+    }
+    logger.warn('Partenaire en échec : bascule sur le suivant', { partenaire: partenaire.name })
+  }
+
+  logger.error('Provisioning eSIM échoué sur tous les partenaires', { paysISO, tentatives: tentatives.length })
+  return { statut: 'ECHEC_PROVISIONING', iccid: null, tentatives }
 }
 
-const signalerEchecProvisionning = (paysISO, tentatives) =>{
-    console.log("ERREUR : Provisioning eSIM échoué")
-    console.log("Pays         : " + paysISO)
-    console.log("Tentatives   : " + tentatives)
-    console.log("Tous les partenaires MVNO ont échoué")
-    console.log("Intervention manuelle requise")
-}
-
-const signalerAucunPartenaire = (paysISO) =>{
-
-    console.log("ERREUR : Aucun partenaire MVNO actif")
-    console.log("Pays : " + paysISO)
-    console.log("eSIM non disponible pour ce pays")
-}
-
-// traitement principal
-const selectionReseauEsim = () =>{
-
-    const utilisateurHasESIM = await verifierBYOE(userId, numberId)
-    if (utilisateurHasESIM === true){
-        await enregistrerBYOE(userId, numberId, paysISO)
-        console.log("Mode BYOE activé — pas de provisioning")
-        return {
-            statut : "BYOE",
-            iccid  : NULL
-        }
-    }
-    const paysOrigine = await recupererPaysOrigine(userId)
-    if (verifierZoneRoamingGratuit(paysOrigine, paysISO) === true){
-        notifierRoamingGratuit(paysOrigine, paysISO)
-        return {
-            statut  : "ROAMING_GRATUIT",
-            iccid   : null
-        }
-    }
-
-    const partenaires = await recupererPartenairesActifs(paysISO)
-    if (partenaires.length === 0){
-        signalerAucunPartenaire(paysISO)
-        return null
-    }
-
-    const partenaireScores = []
-    let i                = 0
-
-    while (i < partenaires.length){
-        const scoreCouverture = await recupererScoreCouverture(partenaires[i].partner_id, paysISO)
-        const scoreLatence = await recupererLatence(partenaires[i].partner_id)
-        const scoreCout = await recupererScoreCout(partenaires[i].partner_id, paysISO)
-        const scoreTotal = calculerScorePartenaire(scoreCouverture, scoreLatence, scoreCout)
-        const p = partenaires[i]
-        
-        partenaireScores.push({
-            partenaire: p,
-            score: scoreTotal
-        });
-        i++
-    }
-
-    const meilleurPartenaire = trouverMeilleurPartenaire(partenaireScores)
-    
-
-    let provisioningOK  = FALSE
-    let tentatives      = 0
-    let indexPartenaire = 0
-    let partenaireCourant = null;
-    let iccid = null;
-
-    while (provisioningOK === false && tentatives < maxTentatives && indexPartenaire < partenaireScores.length){
-        provisionningOk = await provisionnerOTA(partenaireCourant, iccid, userId)
-        iccid = genererICCID(meilleurPartenaire.partenaire.partner_id, paysISO)
-
-        if (provisionningOk === false){
-            console.log("Partenaire " + partenaireCourant.name + " en échec — tentative suivante")
-            indexPartenaire = indexPartenaire + 1
-            tentatives = tentatives + 1
-        }
-    }
-
-    if (provisionningOk === false){
-        signalerEchecProvisioning(paysISO, tentatives)
-        return null
-    }
-
-    await enregistrerESIM(userId, numberId, partenaireCourant.partner_id, iccid, paysISO, PLAN_DEFAUT)
-    notifierProvisionningReussi(userId, partenaireCourant, iccid)
-    return {
-        statut     : "SUCCES",
-        iccid      : iccid,
-        partenaire : partenaireCourant.name,
-        plan       : PLAN_DEFAUT
-
-    }
+module.exports = {
+  PLAN_DEFAUT,
+  QUOTA_DATA_MO,
+  calculerCleLuhn,
+  verifierLuhn,
+  genererICCID,
+  calculerScoreCouverture,
+  calculerScoreLatence,
+  calculerScoreCout,
+  calculerScorePartenaire,
+  classerPartenaires,
+  provisionnerOTA,
+  selectionReseauEsim
 }

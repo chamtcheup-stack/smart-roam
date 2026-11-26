@@ -1,300 +1,176 @@
-const supabase = require ('../supabase')
+'use strict'
 
-const poidsMCCMNC = 0.40
-const poidsCellId = 0.30
-const poidIp = 0.20
-const poidsWifi = 0.10
-const seuilHaute = 70
-const seuilMoyenne = 50
-const dureeAttenteMax = 5
-const intervalleAttente = 1
+// ════════════════════════════════════════════════════════════
+// ALGO 08 — Scoring de confiance géographique
+//
+// Somme pondérée (bornée à 100) des signaux qui désignent le pays visé :
+//   MCC/MNC 40 % × confiance · Cell-ID 30 % · IP 20 % · Wi-Fi aéroport 10 %
+// Niveaux : HAUTE ≥ 70 · MOYENNE ≥ 50 · FAIBLE < 50.
+// Un signal qui désigne un autre pays ne contribue pas au score.
+//
+// Format des signaux (normalisés par normaliserSignaux) :
+//   cellId : { changement_detecte: bool, paysISO? }
+//   mccMnc : { paysISO, confiance (0–100) }          (sortie de l'algo 04)
+//   wifi   : { aeroport_reconnu: bool, paysISO }      (sortie de l'algo 03)
+//   ip     : { paysISO }  ou directement 'FR'
+// ════════════════════════════════════════════════════════════
 
-const arrondir = (valeur) => Math.round(valeur);
+const logger = require('../utils/logger')
+const { journaliserAudit } = require('../utils/audit')
 
-const attendre = (secondes) => new Promise((resolve) => setTimeout(resolve, secondes * 1000));
+const POIDS_MCC_MNC = 0.40
+const POIDS_CELL_ID = 0.30
+const POIDS_IP = 0.20
+const POIDS_WIFI = 0.10
+const SEUIL_HAUTE = 70
+const SEUIL_MOYENNE = 50
+const DUREE_ATTENTE_MAX_SECONDES = 5
 
-// Simule la lecture d'un signal réseau entrant (à adapter selon ton implémentation réelle)
-const lireSignalDisponible = () => {
-    return null;
-};
+const pays = (valeur) => (typeof valeur === 'string' && /^[A-Za-z]{2}$/.test(valeur.trim()) ? valeur.trim().toUpperCase() : null)
 
-const calculerContributionCellID = (signalCellID, paysDestintion) =>{
-    let contribution
-
-    if (signalCellID === null){
-        return 0
-    }
-
-    if (signalCellID.changement_detecte === false){
-        return 0
-    }
-    contribution = poidsCellId * 100
-    return contribution
+const normaliserSignal = (type, signal) => {
+  if (signal === null || signal === undefined) return null
+  if (type === 'ip' && typeof signal === 'string') return { paysISO: pays(signal) }
+  if (typeof signal !== 'object') return null
+  const paysISO = pays(signal.paysISO || signal.pays_iso || signal.pays)
+  switch (type) {
+    case 'cellId':
+      return { changement_detecte: signal.changement_detecte !== false, paysISO }
+    case 'mccMnc':
+      return { paysISO, confiance: Math.max(0, Math.min(100, Number(signal.confiance) || 0)) }
+    case 'wifi':
+      return { aeroport_reconnu: signal.aeroport_reconnu === true || signal.matchTrouve === true, paysISO }
+    case 'ip':
+      return { paysISO }
+    default:
+      return null
+  }
 }
 
-const calculerContributionMCCMNC = (signalMCCMNC, paysDestination) =>{
-    let contribution
+const normaliserSignaux = ({ cellId = null, mccMnc = null, wifi = null, ip = null } = {}) => ({
+  cellId: normaliserSignal('cellId', cellId),
+  mccMnc: normaliserSignal('mccMnc', mccMnc),
+  wifi: normaliserSignal('wifi', wifi),
+  ip: normaliserSignal('ip', ip)
+})
 
-    if (signalMCCMNC === null){
-        return 0
-    }
-
-    if (signalMCCMNC.confiance === 100){
-        contribution = poidsMCCMNC * 100
-    }
-
-    if (signalMCCMNC.confiance === 80){
-        contribution = poidsMCCMNC * 80
-    }
-
-    if (signalMCCMNC.confiance === 0){
-        contribution = 0
-    }
-    return contribution 
+// Un changement de cellule prouve un déplacement ; s'il porte un pays, il doit correspondre.
+const calculerContributionCellID = (signal, paysCible) => {
+  if (!signal || !signal.changement_detecte) return 0
+  if (signal.paysISO && signal.paysISO !== paysCible) return 0
+  return POIDS_CELL_ID * 100
 }
 
-const calculerContributionWifi = (signalWifi, paysDestination) =>{
-    let contribution
-
-    if (signalWifi === null){
-        return 0
-    }
-
-    if (signalWifi.aeroport_reconnu === true && signalWifi.pays_iso === paysDestination){
-        contribution = poidsWifi * 100
-    } else {
-        contribution = 0
-    }
-    return contribution
+const calculerContributionMCCMNC = (signal, paysCible) => {
+  if (!signal || signal.paysISO !== paysCible) return 0
+  return POIDS_MCC_MNC * signal.confiance
 }
 
-const calculerContributionIP = (signalIP, paysDestination) =>{
-    let conntribution
+const calculerContributionWifi = (signal, paysCible) =>
+  (signal && signal.aeroport_reconnu && signal.paysISO === paysCible ? POIDS_WIFI * 100 : 0)
 
-    if (signalIP === null){
-        return 0
-    }
+const calculerContributionIP = (signal, paysCible) =>
+  (signal && signal.paysISO === paysCible ? POIDS_IP * 100 : 0)
 
-    if (signalIP.pays_iso === paysDestination){
-        contribution = poidsIP * 100
-    } else {
-        contribution = 0
-    }
-    return contribution
+// Somme pondérée bornée à 100 (nom conservé pour compatibilité).
+const fusionnerScoresBayesien = (scoreCellID, scoreMCCMNC, scoreWifi, scoreIP) =>
+  Math.round(Math.min(100, scoreCellID + scoreMCCMNC + scoreWifi + scoreIP))
+
+const determinerNiveauCertitude = (scoreFinal) => {
+  if (scoreFinal >= SEUIL_HAUTE) return 'HAUTE'
+  if (scoreFinal >= SEUIL_MOYENNE) return 'MOYENNE'
+  return 'FAIBLE'
 }
 
-const fusionnerScoresBayesien = (scoreCellID, scoreMCCMNC, scoreWifi, scoreIP) =>{
-    let scoreTotal
-    let scoreFinalEntier
-
-    scoreTotal = scoreCellID + scoreMCCMNC + scoreWifi + scoreIP
-    if (scoreToatal > 100){
-        scoreTotal = 100
-    }
-
-    scoreFinalEntier = arrondir(scoreTotal)
-    return scoreFinalEntier
+// Pays le plus probable : MCC fiable > Wi-Fi d'aéroport > IP.
+const determinerPaysCandidat = (signaux) => {
+  const { mccMnc, wifi, ip } = signaux
+  if (mccMnc && mccMnc.paysISO && mccMnc.confiance >= 80) return mccMnc.paysISO
+  if (wifi && wifi.aeroport_reconnu && wifi.paysISO) return wifi.paysISO
+  if (ip && ip.paysISO) return ip.paysISO
+  return null
 }
 
-const determinerNiveauCertitude = (scoreFinal) =>{
-    let niveau 
-
-    if (scoreFinal >= seuilHaute){
-        niveau = "HAUTE"
-    }
-
-    if (scoreFinal >= seuilMoyenne && scoreFinal < seuilHaute){
-        niveau = "MOYENNE"
-    }
-
-    if (scoreFinal < seuilMoyenne){
-        niveau = "FAIBLE"
-    }
-    return niveau
+const calculerScore = (signaux, paysCible) => {
+  const contributions = {
+    cellId: calculerContributionCellID(signaux.cellId, paysCible),
+    mccMnc: calculerContributionMCCMNC(signaux.mccMnc, paysCible),
+    wifi: calculerContributionWifi(signaux.wifi, paysCible),
+    ip: calculerContributionIP(signaux.ip, paysCible)
+  }
+  const scoreFinal = fusionnerScoresBayesien(contributions.cellId, contributions.mccMnc, contributions.wifi, contributions.ip)
+  return { scoreFinal, niveauCertitude: determinerNiveauCertitude(scoreFinal), contributions }
 }
 
-const determinerPaysCandidat = (signalMCCMNC, signalWifi, signalIP) =>{
-    let pays
-
-    if (signalMCCMNC != null && signalMCCMNC.confiance >= 80){
-        return signalMCCMNC.paysISO
-    }
-
-    if (signalWifi != null && signalWifi.aeroport_reconnu === true){
-        return signalWifi.paysISO
-    }
-
-    if (signalIP != null){
-        return signalIP.paysISO
-    }
-    return null;
+// Un signal supplémentaire ({ type: 'MCC_MNC' | 'CELL_ID' | 'WIFI' | 'IP', ... }) remplace le signal du même type.
+const integrerSignalSupplementaire = (signaux, signalSupplementaire) => {
+  const correspondance = { MCC_MNC: 'mccMnc', CELL_ID: 'cellId', WIFI: 'wifi', IP: 'ip' }
+  const type = correspondance[String(signalSupplementaire && signalSupplementaire.type || '').toUpperCase()]
+  if (!type) return signaux
+  return { ...signaux, [type]: normaliserSignal(type, signalSupplementaire) }
 }
 
-const attendreSignalSupplementaire = async (dureeMax) =>{
-    let secondesEcoulees
-    let nouveauSignal
-
-    secondesEcoulees = 0
-    nouveauSignal = null
-
-    while (secondesEcoulees < dureeMax && nouveauSignal === null){
-        await intervalleAttente  
-        nouveauSignal = lireSignalDisponible()
-        secondesEcoulees = secondesEcoulees + intervalleAttente
-    }
-    return nouveauSignal
+// ── Journalisation ──────────────────────────────────────────
+const journaliserScore = (userId, scoreFinal, niveauCertitude, paysCandidat, paysDestination) => {
+  logger.debug('Score de confiance géographique', { userId, scoreFinal, niveauCertitude, paysCandidat, paysDestination })
+  void journaliserAudit({
+    userId,
+    entite: 'GEOLOCALISATION',
+    action: `SCORE_${scoreFinal}_PAYS_${paysCandidat || 'INCONNU'}_DEST_${paysDestination}`
+  })
 }
 
-// procédures
-const journaliserScore = async(userId, scoreFinal, niveauCeritude, paysCandidat, paysDestination) =>{
-
-    try{
-        const{data, error} = await supabase
-        .from('audit_log')
-        .insert([
-            {
-                user_id: userId,
-                entity_type: "GEOLOCALISATION",
-                action: `SCORE_${scoreFinal}_PAYS_${paysCandidat}_DEST_${paysDestination}`,
-                created_at: new Date().toISOString()
-            }
-        ])
-    } catch (error){
-        console.error("Une erreur est survenue:", error)
-        return null
-    }
-    console.log("Score calculé  : " + scoreFinal + "/100")
-    console.log("Certitude      : " + niveauCertitude)
-    console.log("Pays candidat  : " + paysCandidat)
-    console.log("Pays destination : " + paysDestination)
+const journaliserEvenementManque = (userId, scoreFinal, raison) => {
+  logger.info('Activation non déclenchée', { userId, scoreFinal, minimum: SEUIL_HAUTE, raison })
+  void journaliserAudit({ userId, entite: 'GEOLOCALISATION', action: `ACTIVATION_MANQUEE_${raison}_SCORE_${scoreFinal}` })
 }
 
-const journaliserEvenementManque = async (userId, scoreFinal, paysDestination) =>{
+// ── Traitement principal ────────────────────────────────────
+// HAUTE → ACTIVATION_IMMEDIATE ; MOYENNE → attente d'un signal supplémentaire
+// (renvoyé par le client) puis ACTIVATION_APRES_ATTENTE ou ACTIVATION_ECHOUEE ;
+// FAIBLE → ACTIVATION_IMPOSSIBLE.
+const scoringConfianceGeographique = ({ userId = null, paysDestination, signaux, signalSupplementaire = null }) => {
+  const cible = pays(paysDestination)
+  let signauxNormalises = normaliserSignaux(signaux)
+  let { scoreFinal, niveauCertitude, contributions } = calculerScore(signauxNormalises, cible)
+  let paysCandidat = determinerPaysCandidat(signauxNormalises)
+  journaliserScore(userId, scoreFinal, niveauCertitude, paysCandidat, cible)
 
-    try{
-        const {data, error} = await supabase
-        .from('audit_log')
-        .insert([
-            {
-                user_id: userId,
-                entity_type: "GEOLOCALISATION",
-                action: "ACTIVATION_MANQUEE_SCORE" + scoreFinal,
-                actor_type: "SYSTEM",
-                created_at: new Date().toISOString(),
-            }
-        ])
-    } catch (error){
-        console.error("Une erreur est survenue:", error)
-        return null
-    }
-    console.log("Activation manquée — Score insuffisant")
-    console.log("Score obtenu   : " + scoreFinal + "/100")
-    console.log("Score minimum  : " + SEUIL_HAUTE + "/100")
-    console.log("Score minimum  : " + SEUIL_HAUTE + "/100")
-}
+  const resultat = (decision, extra = {}) => ({ decision, scoreFinal, niveauCertitude, paysCandidat, contributions, ...extra })
 
-const signalerScoreFaible = (scoreFinal, paysDestination) =>{
+  if (niveauCertitude === 'HAUTE') return resultat('ACTIVATION_IMMEDIATE')
 
-    console.log("Score de confiance insuffisant : " + scoreFinal + "/100")
-    console.log( "Minimum requis : " + SEUIL_MOYENNE + "/100")
-    console.log("Pays visé      : " + paysDestination)
-    console.log("Activation non déclenchée")
-}
+  if (niveauCertitude === 'FAIBLE') {
+    journaliserEvenementManque(userId, scoreFinal, 'SCORE_FAIBLE')
+    return resultat('ACTIVATION_IMPOSSIBLE')
+  }
 
-const signalAttente = (scoreFinal, dureeAttente) =>{
+  // MOYENNE
+  if (!signalSupplementaire) {
+    return resultat('EN_ATTENTE_SIGNAL', { reessayerDansSecondes: DUREE_ATTENTE_MAX_SECONDES })
+  }
+  signauxNormalises = integrerSignalSupplementaire(signauxNormalises, signalSupplementaire)
+  ;({ scoreFinal, niveauCertitude, contributions } = calculerScore(signauxNormalises, cible))
+  paysCandidat = determinerPaysCandidat(signauxNormalises)
+  journaliserScore(userId, scoreFinal, niveauCertitude, paysCandidat, cible)
 
-    console.log("Score intermédiaire : " + scoreFinal + "/100")
-    console.log("En attente d'un signal supplémentaire")
-    console.log("Durée maximum      : " + dureeAttente + " secondes")
-}
-
-// traitement principal
-const scoringConfianceGeographique = () =>{
-
-
-    let scoreCellID = calculerContributionCellID(signalCellID, paysDestination)
-    let scoreMCCMNC = calculerContributionMCCMNC(signalMCCMNC, paysDestination)
-    let scoreWifi = calculerContributionWifi(signalWifi, paysDestintion)
-    let scoreIP = calculerContributionIP(signalIP, paysDestination)
-    let scoreFinal = fusionnerScoresBayesien(scoreCellID, scoreMCCMNC, scoreWifi, scoreIP)
-    let niveauCertitude = determinerNiveauCertitude(scoreFinal)
-    let paysCandidat = determinerPaysCandidat(signalMCCMNC, signalWifi, signalIP)
-    await journaliserScore (userId, scoreFinal,niveauCertitude, paysCandidat, paysDestination)
-    let decision = "";
-
-    if (niveauCertitude === "HAUTE"){
-        const decision = "ACTIVATION_IMMEDIATE"
-        return {
-            decision        : decision,
-            scoreFinal      : scoreFinal,
-            niveauCertitude : niveauCertitude,
-            paysCandidat    : paysCandidat
-        }
-    }
-
-    if (niveauCertitude === "MOYENNE"){
-        signalerAttente (scoreFinal, dureeAttenteMax)
-        const signalSupp = attendreSignalSupplementaire(dureeAttenteMax)
-
-        if (signalSupp != null){
-
-            if (signalSupp.type === "MMCC_MNC"){
-                signalMCCMNC = signalSupp
-            }
-
-            if (signalSupp.type = "CellID"){
-                signalCellID = signalSupp
-            }
-
-            if (signalSupp.type === "WIFI"){
-                signalWifi = signalSupp
-            }
-
-            if (signalSupp.type === "IP"){
-                signalIP = signalSupp
-            }
-            scoreCellID = calculerContributionCellID(signalCellID, paysDestination)
-            scoreMCCMNC = calculerContributionMCCMNC(signalMCCMNC, paysDestination)
-            scoreWifi = calculerContributionWifi(signalWifi, paysDestination)
-            scoreIP = calculerContributionIP(signalIP, paysDestination)
-            scoreFinal = fusionnerScoresBayesien(scoreCellID, scoreMCCMNC, scoreWifi, scoreIP)
-            niveauCertitude = determinerNiveauCertitude(scoreFinal)
-            paysCandidat    = determinerPaysCandidat(signalMCCMNC, signalWifi, signalIP);
-
-            if (niveauCertitude === "HAUTE"){
-                decision = "ACTIVATION_APRES_ATTENTE"
-                return {
-                    decision        : decision,
-                    scoreFinal      : scoreFinal,
-                    niveauCertitude : niveauCertitude,
-                    paysCandidat    : paysCandidat
-                }
-            }
-        }
-    }
-
-    await journaliserEvenementManque(userId, scoreFinal, paysDestination)
-    decision = "ACTIVATION_ECHOUEE"
-    return {
-        decision        : decision,
-        scoreFinal      : scoreFinal,
-        niveauCertitude : niveauCertitude,
-        paysCandidat    : paysCandidat
-    }
-
-    if (niveauCertitude === "FAIBLE"){
-        signalerScoreFaible(scoreFinal, paysDestination)
-        await journaliserEvenementManque(userId, scoreFinal, paysDestination)
-        decision = "ACTIVATION_IMPOSSIBLE"
-        return {
-            decision        : decision,
-            scoreFinal      : scoreFinal,
-            niveauCertitude : niveauCertitude,
-            paysCandidat    : paysCandidat
-        }
-    }
+  if (niveauCertitude === 'HAUTE') return resultat('ACTIVATION_APRES_ATTENTE')
+  journaliserEvenementManque(userId, scoreFinal, 'APRES_ATTENTE')
+  return resultat('ACTIVATION_ECHOUEE')
 }
 
 module.exports = {
-    scoringConfianceGeographique
-};
+  SEUIL_HAUTE,
+  SEUIL_MOYENNE,
+  normaliserSignaux,
+  calculerContributionCellID,
+  calculerContributionMCCMNC,
+  calculerContributionWifi,
+  calculerContributionIP,
+  fusionnerScoresBayesien,
+  determinerNiveauCertitude,
+  determinerPaysCandidat,
+  calculerScore,
+  integrerSignalSupplementaire,
+  scoringConfianceGeographique
+}

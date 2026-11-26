@@ -1,68 +1,55 @@
+'use strict'
+
 const supabase = require('../supabase')
+const v = require('../utils/validation')
+const { HttpError, introuvable, requeteInvalide, indisponible } = require('../utils/http')
+const { donnees, paginer } = require('../utils/db')
+const { selectionReseauEsim, PLAN_DEFAUT, QUOTA_DATA_MO } = require('../algorithms/algo05_selectionReseauESIM')
+
+const PLANS = Object.keys(QUOTA_DATA_MO)
 
 // ════════════════════════════════════════════
 // POST /api/esim/provision
+// Sélection du réseau et provisioning (algo 05)
 // ════════════════════════════════════════════
 const provisionnerESIM = async (req, res) => {
-  try {
-    const { userId, numberId, paysISO } = req.body
+  v.exigerChamps(req.body, ['userId', 'numberId', 'paysISO'])
+  const userId = v.identifiant(req.body.userId, 'userId')
+  const numberId = v.identifiant(req.body.numberId, 'numberId')
+  const paysISO = v.paysISO(req.body.paysISO, 'paysISO')
+  const plan = v.enumeration(req.body.plan, 'plan', { optionnel: true, defaut: PLAN_DEFAUT, valeurs: PLANS, message: 'Forfait invalide' })
 
-    if (!userId || !numberId || !paysISO) {
-      return res.status(400).json({
-        erreur : 'Champs manquants',
-        requis : ['userId', 'numberId', 'paysISO']
-      })
-    }
+  const numero = donnees(
+    await supabase.from('virtual_number').select('number_id, user_id, country_iso').eq('number_id', numberId).maybeSingle(),
+    'lecture du numéro virtuel'
+  )
+  if (!numero || String(numero.user_id) !== String(userId)) throw introuvable('Numéro virtuel introuvable')
+  if (numero.country_iso !== paysISO) {
+    throw requeteInvalide('Le pays de l\'eSIM doit être celui du numéro virtuel', { paysNumero: numero.country_iso })
+  }
 
-    // Vérifier que le pays existe
-    const { data: pays } = await supabase
-      .from('country')
-      .select('*')
-      .eq('country_iso', paysISO)
-      .single()
+  // Une seule eSIM active par numéro : la demande répétée renvoie l'existante.
+  const existantes = donnees(
+    await supabase.from('esim_profile').select('*').eq('user_id', userId).eq('number_id', numberId).eq('status', 'ACTIVE').limit(1),
+    'recherche d\'une eSIM active'
+  ) || []
+  if (existantes.length > 0) {
+    return res.status(200).json({ message: 'Une eSIM active existe déjà pour ce numéro', esim: existantes[0] })
+  }
 
-    if (!pays) {
-      return res.status(400).json({
-        erreur : 'Pays introuvable : ' + paysISO
-      })
-    }
+  const resultat = await selectionReseauEsim({ userId, numberId, paysISO, plan })
 
-    // Générer un ICCID unique
-    const iccid = '8930' + paysISO +
-                  Date.now().toString().slice(-10)
-
-    const { data, error } = await supabase
-      .from('esim_profile')
-      .insert([{
-        user_id       : userId,
-        number_id     : numberId,
-        iccid         : iccid,
-        country_iso   : paysISO,
-        plan_type     : 'WEEK',
-        data_quota_mb : 1024,
-        data_used_mb  : 0,
-        status        : 'ACTIVE'
-      }])
-      .select()
-      .single()
-
-    if (error) {
-      return res.status(500).json({
-        erreur : 'Erreur provisioning eSIM',
-        detail : error.message
-      })
-    }
-
-    return res.status(201).json({
-      message : 'eSIM provisionnée avec succès',
-      esim    : data
-    })
-
-  } catch (error) {
-    return res.status(500).json({
-      erreur : 'Erreur serveur',
-      detail : error.message
-    })
+  switch (resultat.statut) {
+    case 'SUCCES':
+      return res.status(201).json({ message: 'eSIM provisionnée avec succès', esim: resultat.esim, partenaire: resultat.partenaire, plan })
+    case 'BYOE':
+      return res.status(201).json({ message: 'Mode BYOE : votre propre eSIM sera utilisée', esim: resultat.esim })
+    case 'ROAMING_GRATUIT':
+      return res.status(200).json({ message: 'Roaming UE gratuit : aucune eSIM locale nécessaire', esim: null })
+    case 'AUCUN_PARTENAIRE':
+      throw indisponible('eSIM non disponible pour ce pays (aucun partenaire actif)')
+    default:
+      throw new HttpError(502, 'Le provisioning a échoué chez tous les partenaires, réessayez plus tard', {}, { expose: true })
   }
 }
 
@@ -70,32 +57,14 @@ const provisionnerESIM = async (req, res) => {
 // GET /api/esim/:userId
 // ════════════════════════════════════════════
 const getESIM = async (req, res) => {
-  try {
-    const { userId } = req.params
+  const page = v.pagination(req.query)
+  const { lignes, total } = await paginer(
+    supabase.from('esim_profile').select('*', { count: 'exact' }).eq('user_id', req.params.userId).order('created_at', { ascending: false }),
+    page,
+    'lecture des eSIM'
+  )
 
-    const { data, error } = await supabase
-      .from('esim_profile')
-      .select('*')
-      .eq('user_id', userId)
-
-    if (error) {
-      return res.status(500).json({
-        erreur : 'Erreur lecture eSIMs',
-        detail : error.message
-      })
-    }
-
-    return res.status(200).json({
-      esims : data,
-      total : data.length
-    })
-
-  } catch (error) {
-    return res.status(500).json({
-      erreur : 'Erreur serveur',
-      detail : error.message
-    })
-  }
+  return res.status(200).json({ esims: lignes, total, ...page })
 }
 
 module.exports = { provisionnerESIM, getESIM }

@@ -1,248 +1,142 @@
-const supabase = require ('../supabase')
+'use strict'
 
-const crypto = require('crypto');
-const supabase = require('../supabase');
+// ════════════════════════════════════════════════════════════
+// ALGO 09 — Chiffrement authentifié AES-256-GCM
+//
+// Les clés ne sont plus stockées en clair dans la base (table kms_keys)
+// à côté des données qu'elles protègent : elles proviennent d'un
+// trousseau versionné fourni par l'environnement (ENCRYPTION_KEYS,
+// idéalement injecté par un coffre de secrets) :
+//     ENCRYPTION_KEYS=v1:<64 hex>:2026-01-15,v2:<64 hex>:2026-02-14
+// La dernière entrée est la clé courante (chiffrement) ; les autres ne
+// servent qu'au déchiffrement des anciens messages (rotation sans
+// rupture). La date facultative permet d'alerter au-delà de 30 jours.
+// ════════════════════════════════════════════════════════════
 
-const tailleCle = 32
-const tailleIv = 12
-const modeChiffrement = "AES-GCM"
-const dureeVieCle = 30
+const crypto = require('crypto')
+const config = require('../config')
+const logger = require('../utils/logger')
 
-const genererIV = () =>{
-    let iv
-    iv = crypto.randomBytes (tailleIv)
-    return iv;
+const ALGORITHME = 'aes-256-gcm'
+const TAILLE_CLE = 32 // octets (256 bits)
+const TAILLE_IV = 12 // octets (96 bits, recommandé pour GCM)
+const TAILLE_TAG = 16 // octets
+const DUREE_VIE_CLE_JOURS = 30
+
+const analyserTrousseau = (texte) => {
+  const cles = new Map()
+  let versionCourante = null
+
+  for (const entree of String(texte || '').split(',').map((e) => e.trim()).filter(Boolean)) {
+    const [version, cleHex, dateCreation] = entree.split(':')
+    if (!/^[\w-]{1,32}$/.test(version || '')) throw new Error('ENCRYPTION_KEYS : version de clé invalide')
+    if (!/^[0-9a-f]{64}$/i.test(cleHex || '')) throw new Error(`ENCRYPTION_KEYS : la clé ${version} doit faire 64 caractères hexadécimaux`)
+    const date = dateCreation ? new Date(dateCreation) : null
+    if (date && Number.isNaN(date.getTime())) throw new Error(`ENCRYPTION_KEYS : date invalide pour la clé ${version}`)
+    cles.set(version, { cle: Buffer.from(cleHex, 'hex'), dateCreation: date })
+    versionCourante = version
+  }
+  return { cles, versionCourante }
 }
 
-const recupererCleActuelle = async () => {
-    try {
-        // En situation réelle, ceci interroge AWS KMS, Azure Key Vault ou Supabase
-        const { data, error } = await supabase
-            .from('kms_keys')
-            .select('cle_hex, version')
-            .eq('is_active', true)
-            .maybeSingle();
-
-        if (error || !data) return null;
-
-        return {
-            // Conversion de la clé hexadécimale en Buffer binaire
-            cle: Buffer.from(data.cle_hex, 'hex'),
-            version: data.version
-        };
-    } catch (error) {
-        console.error("Erreur de récupération de la clé active :", error);
-        return null;
-    }
-};
-
-const chiffrerDonnees = (donneesBrutes, cleBuffer, ivBuffer) => {
-    try {
-        // 1. Initialiser le chiffreur
-        const cipher = crypto.createCipheriv(MODE_CHIFFREMENT, cleBuffer, ivBuffer);
-
-        // 2. Chiffrer le message
-        let donneesChiffrees = cipher.update(donneesBrutes, 'utf8', 'hex');
-        donneesChiffrees += cipher.final('hex');
-
-        // 3. Récupérer le tag d'authentification GCM (16 octets par défaut)
-        const tagGCM = cipher.getAuthTag().toString('hex');
-
-        return {
-            donnees_chiffrees: donneesChiffrees,
-            tag_gcm: tagGCM
-        };
-    } catch (error) {
-        console.error("Erreur lors du chiffrement :", error);
-        return null;
-    }
-};
-
-
-const verifierTagGCM = (donneesChriffrees, tagGCMRecu, cle, iv) =>{
-    let integriteValide
-
-    integriteValide = AESGCMChiffrerTag({
-        donnees : donneesChiffrees,
-        tag     : tagGCMRecu,
-        cle     : cle,
-        iv      : iv
-    })
-    return integriteValide;
+let trousseau = null
+const obtenirTrousseau = () => {
+  if (!trousseau) trousseau = analyserTrousseau(config.chiffrement.cles)
+  if (!trousseau.versionCourante) {
+    throw new Error('Chiffrement indisponible : ENCRYPTION_KEYS n\'est pas configuré (voir .env.example)')
+  }
+  return trousseau
 }
 
-
-const dechiffrerDonnees = (donneesChiffreesHex, tagGCMHex, cleBuffer, ivBuffer) => {
-    try {
-        // 1. Initialiser le déchiffreur
-        const decipher = crypto.createDecipheriv(MODE_CHIFFREMENT, cleBuffer, ivBuffer);
-
-        // 2. Attribuer le tag GCM reçu pour vérifier l'authenticité
-        decipher.setAuthTag(Buffer.from(tagGCMHex, 'hex'));
-
-        // 3. Déchiffrer le message
-        let donneesBrutes = decipher.update(donneesChiffreesHex, 'hex', 'utf8');
-        donneesBrutes += decipher.final('utf8');
-
-        return donneesBrutes;
-    } catch (error) {
-        // Si le tag est invalide ou les données altérées, une erreur est levée ici
-        console.error("Déchiffrement échoué : Intégrité non garantie ou clé incorrecte.");
-        return null;
-    }
-};
-
-
-const verifierRotationCle = async (versionCle) => {
-    try {
-        const { data, error } = await supabase
-            .from('kms_keys')
-            .select('created_at')
-            .eq('version', versionCle)
-            .maybeSingle();
-
-        if (error || !data) return false;
-
-        const dateCreation = new Date(data.created_at);
-        const maintenant = new Date();
-        
-        // Calcul du nombre de jours écoulés
-        const differenceMs = maintenant - dateCreation;
-        const joursEcoules = differenceMs / (1000 * 60 * 60 * 24);
-
-        return joursEcoules >= DUREE_VIE_CLE;
-    } catch (error) {
-        console.error("Erreur de vérification de la rotation :", error);
-        return false;
-    }
-};
-
-
-const recupererCleParVersion = async (version) => {
-    try {
-        const { data, error } = await supabase
-            .from('kms_keys')
-            .select('cle_hex')
-            .eq('version', version)
-            .maybeSingle();
-
-        if (error || !data) return null;
-
-        return Buffer.from(data.cle_hex, 'hex');
-    } catch (error) {
-        console.error("Erreur de récupération de la clé version " + version, error);
-        return null;
-    }
-};
-
-// procédures
-const effectuerRotationCle = async () => {
-    try {
-        // Générer une nouvelle clé aléatoire de 32 octets (256 bits)
-        const nouvelleCleBuffer = crypto.randomBytes(TAILLE_CLE);
-        const nouvelleCleHex = nouvelleCleBuffer.toString('hex');
-
-        // Désactiver l'ancienne clé et insérer la nouvelle
-        await supabase.from('kms_keys').update({ is_active: false }).eq('is_active', true);
-        await supabase.from('kms_keys').insert({
-            cle_hex: nouvelleCleHex,
-            is_active: true,
-            created_at: new Date().toISOString()
-        });
-
-        console.log("Rotation de clé effectuée avec succès.");
-    } catch (error) {
-        console.error("Erreur lors de la rotation de clé :", error);
-    }
-};
-
-
-const refuserMessageCorrompu = (raison) =>{
-
-    console.log("Message rejeté — Intégrité compromise");
-    console.log("Raison : " + raison);
-    console.log("Les données ont peut-être été modifiées en transit");
-
-
+// Permet de remplacer le trousseau (tests, rechargement à chaud).
+const chargerTrousseau = (texte) => {
+  trousseau = analyserTrousseau(texte)
+  return trousseau.versionCourante
 }
 
+const genererIV = () => crypto.randomBytes(TAILLE_IV)
 
-const effacerCleMemoire = (cleBuffer) => {
-    if (Buffer.isBuffer(cleBuffer)) {
-        cleBuffer.fill(0); // Remplit le buffer de 0 pour détruire la clé en mémoire
-        console.log("Clé effacée de la mémoire.");
-    }
-};
+const genererNouvelleCle = () => crypto.randomBytes(TAILLE_CLE).toString('hex')
 
-
-// traitement principal
-const chiffrerMessage = (donneesBrutes) =>{
-
-    let cleInfo = await recupererCleActuelle()
-    if (cleInfo === null){
-        console.log ("Erreur : impossible d'accéder au vault")
-    }
-
-    const cleActuelle  = cleInfo.cle
-    const versionCle   = cleInfo.version
-
-    if (verifierRotationCle(versionCle) === true){
-        await effectuerRotationCle()
-        cleInfo      = await recupererCleActuelle()
-        cleActuelle  = cleInfo.cle
-        versionCle   = cleInfo.version
-    }
-
-    const ivBuffer = genererIV()
-    const resultatChiffrement = chiffrerDonnees(donneesBrutes, cleInfo.cle, ivBuffer)
-
-    effacerCleMemoire(cleInfo.cle);
-
-    if (resultatChiffrement === null){
-        console.log("Erreur lors du chiffrement")
-        return null;
-    }
-
-    const donneesChiffrees = resultatChiffrement.donnees_chiffrees
-    const tagGCM           = resultatChiffrement.tag_gcm
-    effacerCleMemoire(cleActuelle)
-
-    return {
-        donnees_chiffrees: resultatChiffrement.donnees_chiffrees,
-        iv: ivBuffer.toString('hex'),
-        tag_gcm: resultatChiffrement.tag_gcm,
-        version_cle: cleInfo.version
-    };
+const chiffrerDonnees = (texteClair, cle, iv, donneesAssociees) => {
+  const chiffreur = crypto.createCipheriv(ALGORITHME, cle, iv, { authTagLength: TAILLE_TAG })
+  if (donneesAssociees) chiffreur.setAAD(Buffer.from(String(donneesAssociees), 'utf8'))
+  const chiffre = Buffer.concat([chiffreur.update(String(texteClair), 'utf8'), chiffreur.final()])
+  return { donnees_chiffrees: chiffre.toString('base64'), tag_gcm: chiffreur.getAuthTag().toString('base64') }
 }
 
+// Lève une erreur si le tag GCM est invalide (données ou AAD altérées, mauvaise clé).
+const dechiffrerDonnees = (donneesChiffrees, tagGCM, cle, iv, donneesAssociees) => {
+  const dechiffreur = crypto.createDecipheriv(ALGORITHME, cle, iv, { authTagLength: TAILLE_TAG })
+  if (donneesAssociees) dechiffreur.setAAD(Buffer.from(String(donneesAssociees), 'utf8'))
+  dechiffreur.setAuthTag(Buffer.from(tagGCM, 'base64'))
+  return Buffer.concat([
+    dechiffreur.update(Buffer.from(donneesChiffrees, 'base64')),
+    dechiffreur.final()
+  ]).toString('utf8')
+}
 
-const dechiffrerMessage = async (payloadRecu) => {
-    const { donnees_chiffrees, iv, tag_gcm, version_cle } = payloadRecu;
+const verifierRotationCle = () => {
+  const { cles, versionCourante } = obtenirTrousseau()
+  const { dateCreation } = cles.get(versionCourante)
+  if (!dateCreation) return { versionCourante, ageJours: null, rotationRecommandee: false }
+  const ageJours = Math.floor((Date.now() - dateCreation.getTime()) / (24 * 60 * 60 * 1000))
+  return { versionCourante, ageJours, rotationRecommandee: ageJours >= DUREE_VIE_CLE_JOURS }
+}
 
-    // Étape 1 : Récupérer la clé correspondant à la version du message
-    const cleBuffer = await recupererCleParVersion(version_cle);
-    if (!cleBuffer) {
-        console.log(`Erreur : Clé version ${version_cle} introuvable.`);
-        return null;
-    }
+const refuserMessageCorrompu = (raison) => {
+  logger.warn('Message chiffré rejeté : intégrité compromise', { raison })
+}
 
-    const ivBuffer = Buffer.from(iv, 'hex');
+// ── Traitement principal ────────────────────────────────────
+// donneesAssociees (AAD) : contexte authentifié non chiffré (ex. userId),
+// qui doit être fourni à l'identique au déchiffrement.
+const chiffrerMessage = (texteClair, { donneesAssociees } = {}) => {
+  const { cles, versionCourante } = obtenirTrousseau()
+  const rotation = verifierRotationCle()
+  if (rotation.rotationRecommandee) {
+    logger.warn('Rotation de la clé de chiffrement recommandée', { version: versionCourante, ageJours: rotation.ageJours })
+  }
 
-    // Étape 2 : Déchiffrer et vérifier l'intégrité via AES-GCM
-    const donneesDechiffrees = dechiffrerDonnees(
-        donnees_chiffrees,
-        tag_gcm,
-        cleBuffer,
-        ivBuffer
-    );
+  const iv = genererIV()
+  const { donnees_chiffrees, tag_gcm } = chiffrerDonnees(texteClair, cles.get(versionCourante).cle, iv, donneesAssociees)
+  return {
+    version_cle: versionCourante,
+    iv: iv.toString('base64'),
+    tag_gcm,
+    donnees_chiffrees
+  }
+}
 
-    // Étape 3 : Effacer la clé de la mémoire
-    effacerCleMemoire(cleBuffer);
+// Retourne le texte clair, ou null si le message est corrompu / la clé inconnue.
+const dechiffrerMessage = (payloadRecu, { donneesAssociees } = {}) => {
+  const { cles } = obtenirTrousseau()
+  const { donnees_chiffrees: donneesChiffrees, iv, tag_gcm: tagGCM, version_cle: versionCle } = payloadRecu || {}
 
-    if (!donneesDechiffrees) {
-        refuserMessageCorrompu("Tag GCM invalide ou données altérées en transit.");
-        return null;
-    }
+  const entree = cles.get(versionCle)
+  if (!entree) {
+    refuserMessageCorrompu(`clé de version « ${versionCle} » inconnue`)
+    return null
+  }
+  try {
+    const ivBuffer = Buffer.from(String(iv), 'base64')
+    if (ivBuffer.length !== TAILLE_IV) throw new Error('IV invalide')
+    return dechiffrerDonnees(donneesChiffrees, tagGCM, entree.cle, ivBuffer, donneesAssociees)
+  } catch {
+    refuserMessageCorrompu('tag GCM invalide ou données altérées')
+    return null
+  }
+}
 
-    return donneesDechiffrees;
-};
+module.exports = {
+  ALGORITHME,
+  chiffrerMessage,
+  dechiffrerMessage,
+  chiffrerDonnees,
+  dechiffrerDonnees,
+  verifierRotationCle,
+  genererNouvelleCle,
+  genererIV,
+  chargerTrousseau,
+  analyserTrousseau
+}

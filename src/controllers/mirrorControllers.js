@@ -1,197 +1,127 @@
+'use strict'
+
 const supabase = require('../supabase')
+const v = require('../utils/validation')
+const { introuvable } = require('../utils/http')
+const { donnees, executerSansEchec, paginer } = require('../utils/db')
+const { auditerRequete } = require('../utils/audit')
+const {
+  NOM_PAR_DEFAUT,
+  DUREE_CONSENTEMENT_JOURS,
+  synchroniserProfilMiroir
+} = require('../algorithms/algo18_synchronisationMiroir')
+
+const TYPES_DONNEES = ['PROFILE', 'LOCATION', 'TRANSACTION', 'AVATAR']
+const COLONNES_MIROIR = 'number_id, did_number, country_iso, status, mirror_display_name, mirror_avatar_url, mirror_synced_at'
 
 // ════════════════════════════════════════════
 // POST /api/mirror/sync
-// Synchroniser le profil miroir
 // ════════════════════════════════════════════
 const synchroniserMiroir = async (req, res) => {
-  try {
-    const { userId, numberId } = req.body
+  v.exigerChamps(req.body, ['userId', 'numberId'])
+  const userId = v.identifiant(req.body.userId, 'userId')
+  const numberId = v.identifiant(req.body.numberId, 'numberId')
 
-    if (!userId || !numberId) {
-      return res.status(400).json({
-        erreur : 'Champs manquants',
-        requis : ['userId', 'numberId']
-      })
-    }
+  const resultat = await synchroniserProfilMiroir(userId, numberId)
+  if (resultat.statut === 'NUMERO_INTROUVABLE') throw introuvable('Numéro virtuel introuvable')
+  if (resultat.statut === 'PROFIL_INTROUVABLE') throw introuvable('Utilisateur introuvable')
 
-    // Récupérer le numéro virtuel
-    const { data: numero } = await supabase
-      .from('virtual_number')
-      .select('*')
-      .eq('number_id', numberId)
-      .single()
-
-    if (!numero) {
-      return res.status(404).json({
-        erreur : 'Numéro virtuel introuvable'
-      })
-    }
-
-    // Récupérer le profil utilisateur
-    const { data: user } = await supabase
-      .from('users')
-      .select('*')
-      .eq('user_id', userId)
-      .single()
-
-    if (!user) {
-      return res.status(404).json({
-        erreur : 'Utilisateur introuvable'
-      })
-    }
-
-    // Vérifier le consentement pour ce pays
-    const paysDestination = numero.country_iso
-
-    const { data: consentement } = await supabase
-      .from('data_sovereignty_consent')
-      .select('*')
-      .eq('user_id', userId)
-      .eq('destination_country', paysDestination)
-      .eq('data_type', 'PROFILE')
-      .eq('is_granted', true)
-      .single()
-
-    // Construire le profil miroir
-    const nomAutorise    = consentement !== null
-    const badgeKYC       = user.kyc_status === 'VERIFIED'
-                           ? 'KYC_VERIFIE'
-                           : 'AUCUN'
-
-    const displayName = nomAutorise
-      ? user.phone_number
-      : 'Utilisateur Orange'
-
-    // Mettre à jour le numéro virtuel
-    const { data, error } = await supabase
-      .from('virtual_number')
-      .update({
-        mirror_display_name : displayName,
-        mirror_avatar_url   : null,
-        mirror_synced_at    : new Date()
-      })
-      .eq('number_id', numberId)
-      .select()
-      .single()
-
-    if (error) {
-      return res.status(500).json({
-        erreur : 'Erreur synchronisation miroir',
-        detail : error.message
-      })
-    }
-
-    return res.status(200).json({
-      message      : 'Profil miroir synchronisé avec succès',
-      numero       : data,
-      nomAutorise  : nomAutorise,
-      badgeKYC     : badgeKYC
-    })
-
-  } catch (error) {
-    console.error('Erreur synchroniserMiroir :', error)
-    return res.status(500).json({
-      erreur : 'Erreur serveur',
-      detail : error.message
-    })
-  }
+  return res.status(200).json({
+    message: resultat.statut === 'SYNCHRONISE_PARTIEL'
+      ? 'Profil miroir synchronisé partiellement (partage de photo interdit dans ce pays)'
+      : 'Profil miroir synchronisé avec succès',
+    numero: resultat.numero,
+    profilMiroir: resultat.profilMiroir,
+    nomAutorise: resultat.nomAutorise,
+    avatarAutorise: resultat.avatarAutorise,
+    badgeKYC: resultat.profilMiroir.kyc_badge
+  })
 }
 
 // ════════════════════════════════════════════
 // GET /api/mirror/:userId
-// Récupérer le profil miroir d'un utilisateur
 // ════════════════════════════════════════════
 const getProfilMiroir = async (req, res) => {
-  try {
-    const { userId } = req.params
-
-    const { data, error } = await supabase
+  const page = v.pagination(req.query)
+  const { lignes, total } = await paginer(
+    supabase
       .from('virtual_number')
-      .select('*')
-      .eq('user_id', userId)
+      .select(COLONNES_MIROIR, { count: 'exact' })
+      .eq('user_id', req.params.userId)
       .not('mirror_display_name', 'is', null)
+      .order('mirror_synced_at', { ascending: false }),
+    page,
+    'lecture des profils miroir'
+  )
 
-    if (error) {
-      return res.status(500).json({
-        erreur : 'Erreur lecture profil miroir',
-        detail : error.message
-      })
-    }
-
-    return res.status(200).json({
-      message  : 'Profils miroir récupérés',
-      profils  : data,
-      total    : data.length
-    })
-
-  } catch (error) {
-    return res.status(500).json({
-      erreur : 'Erreur serveur',
-      detail : error.message
-    })
-  }
+  return res.status(200).json({
+    message: 'Profils miroir récupérés',
+    profils: lignes,
+    total,
+    ...page
+  })
 }
 
 // ════════════════════════════════════════════
 // POST /api/mirror/consent
-// Gérer les consentements de partage
+// Accorder (isGranted absent ou true) ou retirer (false) un consentement.
 // ════════════════════════════════════════════
 const gererConsentement = async (req, res) => {
-  try {
-    const { userId, paysDestination, dataType, isGranted } = req.body
+  v.exigerChamps(req.body, ['userId', 'paysDestination', 'dataType'])
+  const userId = v.identifiant(req.body.userId, 'userId')
+  const paysDestination = v.paysISO(req.body.paysDestination, 'paysDestination')
+  const dataType = v.enumeration(req.body.dataType, 'dataType', { valeurs: TYPES_DONNEES, message: 'Type de donnée invalide' })
+  const isGranted = v.booleen(req.body.isGranted, 'isGranted', { optionnel: true, defaut: true })
 
-    if (!userId || !paysDestination || !dataType) {
-      return res.status(400).json({
-        erreur : 'Champs manquants',
-        requis : ['userId', 'paysDestination', 'dataType']
-      })
-    }
-
-    const typesValides = ['PROFILE', 'LOCATION', 'TRANSACTION', 'AVATAR']
-    if (!typesValides.includes(dataType)) {
-      return res.status(400).json({
-        erreur  : 'Type de donnée invalide',
-        valides : typesValides
-      })
-    }
-
-    // Date d'expiration 30 jours
-    const expiresAt = new Date()
-    expiresAt.setDate(expiresAt.getDate() + 30)
-
-    const { data, error } = await supabase
-      .from('data_sovereignty_consent')
-      .upsert([{
-        user_id             : userId,
-        destination_country : paysDestination,
-        data_type           : dataType,
-        is_granted          : isGranted !== false,
-        granted_at          : new Date(),
-        expires_at          : expiresAt,
-        legal_basis         : 'RGPD_CONSENT'
-      }])
-      .select()
-      .single()
-
-    if (error) {
-      return res.status(500).json({
-        erreur : 'Erreur gestion consentement',
-        detail : error.message
-      })
-    }
-
-    return res.status(200).json({
-      message      : 'Consentement mis à jour',
-      consentement : data
-    })
-
-  } catch (error) {
-    return res.status(500).json({
-      erreur : 'Erreur serveur',
-      detail : error.message
-    })
+  const maintenant = new Date()
+  const champs = {
+    is_granted: isGranted,
+    granted_at: maintenant.toISOString(),
+    expires_at: new Date(maintenant.getTime() + DUREE_CONSENTEMENT_JOURS * 24 * 60 * 60 * 1000).toISOString(),
+    legal_basis: 'RGPD_CONSENT'
   }
+
+  // Mise à jour de l'enregistrement existant, sinon création (aucun doublon).
+  const misAJour = donnees(
+    await supabase
+      .from('data_sovereignty_consent')
+      .update(champs)
+      .eq('user_id', userId)
+      .eq('destination_country', paysDestination)
+      .eq('data_type', dataType)
+      .select(),
+    'mise à jour du consentement'
+  ) || []
+
+  const consentement = misAJour[0] || donnees(
+    await supabase
+      .from('data_sovereignty_consent')
+      .insert([{ user_id: userId, destination_country: paysDestination, data_type: dataType, ...champs }])
+      .select()
+      .single(),
+    'création du consentement'
+  )
+
+  // Retrait du consentement : les données déjà publiées dans ce pays sont retirées.
+  if (!isGranted && (dataType === 'PROFILE' || dataType === 'AVATAR')) {
+    const retrait = dataType === 'PROFILE' ? { mirror_display_name: NOM_PAR_DEFAUT } : { mirror_avatar_url: null }
+    await executerSansEchec(
+      supabase.from('virtual_number').update(retrait).eq('user_id', userId).eq('country_iso', paysDestination),
+      'retrait des données du profil miroir'
+    )
+  }
+
+  // Traçabilité RGPD des décisions de consentement.
+  void auditerRequete(req, {
+    userId,
+    entite: 'CONSENT',
+    action: `CONSENTEMENT_${isGranted ? 'ACCORDE' : 'RETIRE'}_${dataType}_${paysDestination}`
+  })
+
+  return res.status(200).json({
+    message: isGranted ? 'Consentement accordé' : 'Consentement retiré',
+    consentement
+  })
 }
 
 module.exports = {

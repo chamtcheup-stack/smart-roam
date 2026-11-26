@@ -1,178 +1,126 @@
+'use strict'
+
 const supabase = require('../supabase')
+const v = require('../utils/validation')
+const { introuvable, conflit, requeteInvalide } = require('../utils/http')
+const { donnees, paginer } = require('../utils/db')
+const { auditerRequete } = require('../utils/audit')
+const { decalerNumero } = require('../utils/numeros')
+const { JITStockManager, calculerTauxOccupation, QUANTITE_MINIMUM } = require('../algorithms/algo19_jitStockManager')
+
+const QUANTITE_MAXIMUM = 10000000
+
+const enrichirPool = (pool) => {
+  const taux = calculerTauxOccupation(pool.allocated_count, pool.total_numbers)
+  return {
+    ...pool,
+    tauxOccupation: `${(taux * 100).toFixed(1)}%`,
+    tauxOccupationValeur: Number(taux.toFixed(4)),
+    numerosDisponibles: Math.max(0, pool.total_numbers - pool.allocated_count)
+  }
+}
 
 // ════════════════════════════════════════════
-// GET /api/stock/pools
-// Voir l'état de tous les pools DID
+// GET /api/stock/pools   (ADMIN / SERVICE)
 // ════════════════════════════════════════════
 const getPools = async (req, res) => {
-  try {
-    const { data, error } = await supabase
-      .from('did_pool')
-      .select('*')
-      .eq('status', 'ACTIVE')
+  const page = v.pagination(req.query)
+  const { lignes, total } = await paginer(
+    supabase.from('did_pool').select('*', { count: 'exact' }).eq('status', 'ACTIVE').order('country_iso', { ascending: true }),
+    page,
+    'lecture des pools DID'
+  )
 
-    if (error) {
-      return res.status(500).json({
-        erreur : 'Erreur lecture pools',
-        detail : error.message
-      })
-    }
-
-    // Calculer le taux d'occupation pour chaque pool
-    const poolsAvecTaux = data.map(pool => ({
-      ...pool,
-      tauxOccupation : pool.total_numbers > 0
-        ? parseFloat(
-            ((pool.allocated_count / pool.total_numbers) * 100)
-            .toFixed(1)
-          ) + '%'
-        : '0%',
-      numerosDisponibles : pool.total_numbers - pool.allocated_count
-    }))
-
-    return res.status(200).json({
-      message : 'État des pools DID',
-      pools   : poolsAvecTaux,
-      total   : poolsAvecTaux.length
-    })
-
-  } catch (error) {
-    return res.status(500).json({
-      erreur : 'Erreur serveur',
-      detail : error.message
-    })
-  }
+  return res.status(200).json({
+    message: 'État des pools DID',
+    pools: lignes.map(enrichirPool),
+    total,
+    ...page
+  })
 }
 
 // ════════════════════════════════════════════
-// POST /api/stock/check
-// Vérifier si un pool a besoin de réappro
+// POST /api/stock/check   (ADMIN / SERVICE)
+// Analyse JIT des pools d'un pays (algo 19) : commande si nécessaire.
 // ════════════════════════════════════════════
 const verifierStock = async (req, res) => {
-  try {
-    const { paysISO } = req.body
+  const paysISO = v.paysISO(req.body.paysISO, 'paysISO')
 
-    if (!paysISO) {
-      return res.status(400).json({
-        erreur : 'paysISO obligatoire'
-      })
-    }
+  const rapport = await JITStockManager({ paysISO })
+  if (rapport.length === 0) throw introuvable('Pool introuvable pour ce pays', { pays: paysISO })
 
-    const { data: pool, error } = await supabase
-      .from('did_pool')
-      .select('*')
-      .eq('country_iso', paysISO)
-      .eq('status', 'ACTIVE')
-      .single()
-
-    if (error || !pool) {
-      return res.status(404).json({
-        erreur : 'Pool introuvable pour ce pays',
-        pays   : paysISO
-      })
-    }
-
-    const tauxOccupation      = pool.allocated_count / pool.total_numbers
-    const numerosRestants     = pool.total_numbers - pool.allocated_count
-    const alerteRequise       = tauxOccupation >= 0.90
-    const commandeEnCours     = pool.reorder_status === 'REORDER_PENDING'
-
-    // Déclencher une alerte si stock critique
-    if (alerteRequise && !commandeEnCours) {
-      await supabase
-        .from('did_pool')
-        .update({ reorder_status: 'REORDER_PENDING' })
-        .eq('pool_id', pool.pool_id)
-
-      console.warn('ALERTE STOCK : Pool ' + paysISO +
-        ' à ' + Math.round(tauxOccupation * 100) + '%')
-    }
-
-    return res.status(200).json({
-      message            : 'Vérification stock terminée',
-      paysISO            : paysISO,
-      totalNumeros       : pool.total_numbers,
-      numerosAttribues   : pool.allocated_count,
-      numerosRestants    : numerosRestants,
-      tauxOccupation     : Math.round(tauxOccupation * 100) + '%',
-      alerteRequise      : alerteRequise,
-      commandeEnCours    : commandeEnCours,
-      statutReappro      : pool.reorder_status
-    })
-
-  } catch (error) {
-    console.error('Erreur verifierStock :', error)
-    return res.status(500).json({
-      erreur : 'Erreur serveur',
-      detail : error.message
-    })
-  }
+  void auditerRequete(req, { entite: 'STOCK', action: `CONTROLE_STOCK_${paysISO}` })
+  return res.status(200).json({
+    message: 'Vérification stock terminée',
+    paysISO,
+    alerteRequise: rapport.some((ligne) => ligne.action !== 'OK'),
+    pools: rapport
+  })
 }
 
 // ════════════════════════════════════════════
-// PUT /api/stock/reorder/:poolId
-// Confirmer une commande de réapprovisionnement
+// PUT /api/stock/reorder/:poolId   (ADMIN / SERVICE)
+// Confirmer la livraison d'une commande de réapprovisionnement.
 // ════════════════════════════════════════════
 const confirmerReappro = async (req, res) => {
-  try {
-    const { poolId }   = req.params
-    const { quantite } = req.body
+  const poolId = v.identifiant(req.params.poolId, 'poolId')
+  const quantite = v.entier(req.body.quantite, 'quantite', { min: QUANTITE_MINIMUM, max: QUANTITE_MAXIMUM })
 
-    if (!quantite || quantite < 10000) {
-      return res.status(400).json({
-        erreur   : 'Quantité invalide',
-        minimum  : 10000
-      })
-    }
-
-    // Récupérer le pool
-    const { data: pool } = await supabase
-      .from('did_pool')
-      .select('*')
-      .eq('pool_id', poolId)
-      .single()
-
-    if (!pool) {
-      return res.status(404).json({
-        erreur : 'Pool introuvable'
-      })
-    }
-
-    // Mettre à jour le pool
-    const { data, error } = await supabase
-      .from('did_pool')
-      .update({
-        total_numbers  : pool.total_numbers + quantite,
-        reorder_status : 'REORDER_CONFIRMED'
-      })
-      .eq('pool_id', poolId)
-      .select()
-      .single()
-
-    if (error) {
-      return res.status(500).json({
-        erreur : 'Erreur confirmation réapprovisionnement',
-        detail : error.message
-      })
-    }
-
-    return res.status(200).json({
-      message          : 'Réapprovisionnement confirmé',
-      pool             : data,
-      numerosAjoutes   : quantite,
-      nouveauTotal     : data.total_numbers
-    })
-
-  } catch (error) {
-    return res.status(500).json({
-      erreur : 'Erreur serveur',
-      detail : error.message
-    })
+  const pool = donnees(
+    await supabase.from('did_pool').select('*').eq('pool_id', poolId).maybeSingle(),
+    'lecture du pool'
+  )
+  if (!pool) throw introuvable('Pool introuvable')
+  if (pool.reorder_status !== 'REORDER_PENDING') {
+    throw conflit('Aucune commande de réapprovisionnement en attente pour ce pool', { statutReappro: pool.reorder_status || null })
   }
+
+  const miseAJour = { total_numbers: pool.total_numbers + quantite, reorder_status: 'REORDER_CONFIRMED' }
+  if (pool.range_end) {
+    const nouvelleFin = decalerNumero(pool.range_end, quantite)
+    if (!nouvelleFin) throw requeteInvalide('La plage de numéros ne peut pas être étendue de cette quantité', { rangeEnd: pool.range_end })
+    miseAJour.range_end = nouvelleFin
+  }
+
+  // Mise à jour conditionnelle : échoue si le pool a changé entre-temps.
+  const lignes = donnees(
+    await supabase
+      .from('did_pool')
+      .update(miseAJour)
+      .eq('pool_id', poolId)
+      .eq('total_numbers', pool.total_numbers)
+      .eq('reorder_status', 'REORDER_PENDING')
+      .select(),
+    'confirmation du réapprovisionnement'
+  ) || []
+  if (lignes.length === 0) throw conflit('Le pool a été modifié entre-temps : réessayez')
+
+  void auditerRequete(req, { entite: 'STOCK', action: `REAPPRO_CONFIRME_${poolId}_${quantite}` })
+  return res.status(200).json({
+    message: 'Réapprovisionnement confirmé',
+    pool: enrichirPool(lignes[0]),
+    numerosAjoutes: quantite,
+    nouveauTotal: lignes[0].total_numbers
+  })
+}
+
+// ════════════════════════════════════════════
+// POST /api/stock/jit/run   (ADMIN / SERVICE)
+// Exécution manuelle du JIT Stock Manager sur tous les pools.
+// ════════════════════════════════════════════
+const lancerJIT = async (req, res) => {
+  const rapport = await JITStockManager()
+  void auditerRequete(req, { entite: 'STOCK', action: 'JIT_MANUEL' })
+  return res.status(200).json({
+    message: 'Analyse JIT terminée',
+    commandes: rapport.filter((ligne) => ligne.action === 'COMMANDE_PASSEE').length,
+    rapport
+  })
 }
 
 module.exports = {
   getPools,
   verifierStock,
-  confirmerReappro
+  confirmerReappro,
+  lancerJIT
 }

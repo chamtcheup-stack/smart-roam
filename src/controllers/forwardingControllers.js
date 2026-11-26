@@ -1,255 +1,216 @@
+'use strict'
+
 const supabase = require('../supabase')
-const { evaluerRequeteWAF } = require('../algorithms/algo13_detectionWAF')
+const v = require('../utils/validation')
+const { requeteInvalide, introuvable } = require('../utils/http')
+const { donnees, paginer } = require('../utils/db')
+const {
+  ACTIONS,
+  CONDITIONS,
+  STATUTS_LIGNE,
+  ACTION_FORWARD,
+  memeNumero,
+  invaliderCacheRegles,
+  moteurRegleForwarding
+} = require('../algorithms/algo16_moteurForwarding')
+
+const VARIANTES_STATUT_LIGNE = [...STATUTS_LIGNE, 'BUSY', 'NO_ANSWER']
+
+const lireStatutLigne = (valeur) => {
+  if (v.estAbsent(valeur)) return 'LIBRE'
+  const texte = String(valeur).trim().toUpperCase().replace(/[\s-]+/g, '_')
+  if (!VARIANTES_STATUT_LIGNE.includes(texte)) {
+    throw requeteInvalide('statutLigne invalide', { champ: 'statutLigne', valides: STATUTS_LIGNE })
+  }
+  return texte
+}
 
 // ════════════════════════════════════════════
 // POST /api/forwarding/rules/create
-// Créer une règle de forwarding
 // ════════════════════════════════════════════
 const creerRegle = async (req, res) => {
-  try {
-    const {
-      userId,
-      numberId,
-      triggerCondition,
-      action,
-      targetNumber,
-      priority
-    } = req.body
+  v.exigerChamps(req.body, ['userId', 'numberId', 'triggerCondition', 'action'])
+  const userId = v.identifiant(req.body.userId, 'userId')
+  const numberId = v.identifiant(req.body.numberId, 'numberId')
+  const triggerCondition = v.enumeration(req.body.triggerCondition, 'triggerCondition', { valeurs: CONDITIONS, message: 'Condition invalide' })
+  const action = v.enumeration(req.body.action, 'action', { valeurs: ACTIONS, message: 'Action invalide' })
+  const targetNumber = v.telephone(req.body.targetNumber, 'targetNumber', { optionnel: true }) || null
+  const priority = v.entier(req.body.priority, 'priority', { optionnel: true, defaut: 1, min: 0, max: 1000 })
 
-    // Vérifier les champs obligatoires
-    if (!userId || !numberId || !triggerCondition || !action) {
-      return res.status(400).json({
-        erreur : 'Champs manquants',
-        requis : ['userId', 'numberId', 'triggerCondition', 'action']
-      })
+  const numero = donnees(
+    await supabase.from('virtual_number').select('number_id, user_id, did_number').eq('number_id', numberId).maybeSingle(),
+    'lecture du numéro virtuel'
+  )
+  if (!numero || String(numero.user_id) !== String(userId)) throw introuvable('Numéro virtuel introuvable')
+
+  if (action === ACTION_FORWARD) {
+    if (!targetNumber) throw requeteInvalide('targetNumber est obligatoire pour l\'action FORWARD', { champ: 'targetNumber' })
+    if (memeNumero(targetNumber, numero.did_number)) {
+      throw requeteInvalide('Renvoyer un numéro vers lui-même créerait une boucle', { champ: 'targetNumber' })
     }
+  }
 
-    // Vérifier que la condition est valide
-    const conditionsValides = ['ALWAYS', 'BUSY', 'NO_ANSWER', 'NEVER']
-    if (!conditionsValides.includes(triggerCondition)) {
-      return res.status(400).json({
-        erreur    : 'Condition invalide',
-        valides   : conditionsValides
-      })
-    }
-
-    // Vérifier que l'action est valide
-    const actionsValides = ['FORWARD', 'VOICEMAIL', 'REJECT', 'RING']
-    if (!actionsValides.includes(action)) {
-      return res.status(400).json({
-        erreur  : 'Action invalide',
-        valides : actionsValides
-      })
-    }
-
-    // Créer la règle dans Supabase
-    const { data, error } = await supabase
+  const regle = donnees(
+    await supabase
       .from('forwarding_rule')
       .insert([{
-        number_id         : numberId,
-        user_id           : userId,
-        trigger_condition : triggerCondition,
-        action            : action,
-        target_number     : targetNumber || null,
-        priority          : priority || 1,
-        is_active         : true
+        number_id: numberId,
+        user_id: userId,
+        trigger_condition: triggerCondition,
+        action,
+        target_number: action === ACTION_FORWARD ? targetNumber : null,
+        priority,
+        is_active: true
       }])
       .select()
-      .single()
+      .single(),
+    'création de la règle de forwarding'
+  )
+  invaliderCacheRegles(userId)
 
-    if (error) {
-      return res.status(500).json({
-        erreur : 'Erreur création règle',
-        detail : error.message
-      })
-    }
-
-    return res.status(201).json({
-      message : 'Règle de forwarding créée avec succès',
-      regle   : data
-    })
-
-  } catch (error) {
-    console.error('Erreur creerRegle :', error)
-    return res.status(500).json({
-      erreur : 'Erreur serveur',
-      detail : error.message
-    })
-  }
+  return res.status(201).json({
+    message: 'Règle de forwarding créée avec succès',
+    regle
+  })
 }
 
 // ════════════════════════════════════════════
 // GET /api/forwarding/rules/:userId
-// Récupérer toutes les règles d'un utilisateur
 // ════════════════════════════════════════════
 const getRegles = async (req, res) => {
-  try {
-    const { userId } = req.params
-
-    if (!userId) {
-      return res.status(400).json({
-        erreur : 'userId manquant'
-      })
-    }
-
-    const { data, error } = await supabase
+  const page = v.pagination(req.query)
+  const { lignes, total } = await paginer(
+    supabase
       .from('forwarding_rule')
-      .select('*')
-      .eq('user_id', userId)
-      .order('priority', { ascending: true })
+      .select('*', { count: 'exact' })
+      .eq('user_id', req.params.userId)
+      .order('priority', { ascending: true }),
+    page,
+    'lecture des règles de forwarding'
+  )
 
-    if (error) {
-      return res.status(500).json({
-        erreur : 'Erreur lecture règles',
-        detail : error.message
-      })
-    }
-
-    return res.status(200).json({
-      message : 'Règles récupérées',
-      regles  : data,
-      total   : data.length
-    })
-
-  } catch (error) {
-    console.error('Erreur getRegles :', error)
-    return res.status(500).json({
-      erreur : 'Erreur serveur',
-      detail : error.message
-    })
-  }
+  return res.status(200).json({
+    message: 'Règles récupérées',
+    regles: lignes,
+    total,
+    ...page
+  })
 }
 
 // ════════════════════════════════════════════
-// POST /api/forwarding/evaluate
-// Évaluer quelle règle appliquer pour un appel
+// PUT /api/forwarding/rules/:ruleId
+// Modifier une règle (champs facultatifs : triggerCondition, action,
+// targetNumber, priority, isActive)
+// ════════════════════════════════════════════
+const CHAMPS_MODIFIABLES = ['triggerCondition', 'action', 'targetNumber', 'priority', 'isActive']
+
+const modifierRegle = async (req, res) => {
+  const ruleId = v.identifiant(req.params.ruleId, 'ruleId')
+  const corps = req.body
+
+  const regle = donnees(
+    await supabase.from('forwarding_rule').select('*').eq('rule_id', ruleId).maybeSingle(),
+    'lecture de la règle'
+  )
+  if (!regle) throw introuvable('Règle introuvable')
+
+  const champs = {}
+  if ('triggerCondition' in corps) {
+    champs.trigger_condition = v.enumeration(corps.triggerCondition, 'triggerCondition', { valeurs: CONDITIONS, message: 'Condition invalide' })
+  }
+  if ('action' in corps) champs.action = v.enumeration(corps.action, 'action', { valeurs: ACTIONS, message: 'Action invalide' })
+  if ('targetNumber' in corps) {
+    champs.target_number = corps.targetNumber === null ? null : v.telephone(corps.targetNumber, 'targetNumber')
+  }
+  if ('priority' in corps) champs.priority = v.entier(corps.priority, 'priority', { min: 0, max: 1000 })
+  if ('isActive' in corps) champs.is_active = v.booleen(corps.isActive, 'isActive')
+  if (Object.keys(champs).length === 0) {
+    throw requeteInvalide('Aucun champ à modifier', { modifiables: CHAMPS_MODIFIABLES })
+  }
+
+  // Cohérence évaluée sur la règle finale (ancienne valeur + modifications).
+  const finale = { ...regle, ...champs }
+  if (finale.action === ACTION_FORWARD) {
+    if (!finale.target_number) throw requeteInvalide('targetNumber est obligatoire pour l\'action FORWARD', { champ: 'targetNumber' })
+    const numero = donnees(
+      await supabase.from('virtual_number').select('did_number').eq('number_id', regle.number_id).maybeSingle(),
+      'lecture du numéro virtuel'
+    )
+    if (numero && memeNumero(finale.target_number, numero.did_number)) {
+      throw requeteInvalide('Renvoyer un numéro vers lui-même créerait une boucle', { champ: 'targetNumber' })
+    }
+  } else {
+    champs.target_number = null
+  }
+
+  const miseAJour = donnees(
+    await supabase.from('forwarding_rule').update(champs).eq('rule_id', ruleId).select().single(),
+    'modification de la règle'
+  )
+  invaliderCacheRegles(regle.user_id)
+
+  return res.status(200).json({ message: 'Règle mise à jour', regle: miseAJour })
+}
+
+// ════════════════════════════════════════════
+// POST /api/forwarding/evaluate   (SERVICE / ADMIN)
+// Décision de routage d'un appel entrant (algo 16)
 // ════════════════════════════════════════════
 const evaluerAppel = async (req, res) => {
-  try {
-    const { numeroAppele, numeroAppelant, statutLigne } = req.body
+  v.exigerChamps(req.body, ['numeroAppele', 'numeroAppelant'])
+  const numeroAppele = v.telephone(req.body.numeroAppele, 'numeroAppele')
+  // L'appelant peut être masqué (« anonymous ») : simple chaîne.
+  const numeroAppelant = v.chaine(String(req.body.numeroAppelant), 'numeroAppelant', { max: 64 })
+  const statutLigne = lireStatutLigne(req.body.statutLigne)
 
-    if (!numeroAppele || !numeroAppelant) {
-      return res.status(400).json({
-        erreur : 'Champs manquants',
-        requis : ['numeroAppele', 'numeroAppelant']
-      })
-    }
+  const resultat = await moteurRegleForwarding(numeroAppele, numeroAppelant, statutLigne)
 
-    // Trouver à qui appartient le numéro
-    const { data: numero } = await supabase
-      .from('virtual_number')
-      .select('user_id')
-      .eq('did_number', numeroAppele)
-      .eq('status', 'ACTIVE')
-      .single()
-
-    if (!numero) {
-      return res.status(404).json({
-        erreur   : 'Numéro DID introuvable ou inactif',
-        decision : 'REJECT'
-      })
-    }
-
-    // Charger les règles de cet utilisateur
-    const { data: regles } = await supabase
-      .from('forwarding_rule')
-      .select('*')
-      .eq('user_id', numero.user_id)
-      .eq('is_active', true)
-      .order('priority', { ascending: true })
-
-    // Si aucune règle → sonner directement
-    if (!regles || regles.length === 0) {
-      return res.status(200).json({
-        message     : 'Aucune règle configurée',
-        decision    : 'RING',
-        destination : numeroAppele
-      })
-    }
-
-    // Évaluer les règles dans l'ordre
-    let regleAppliquee = null
-    const statut       = statutLigne || 'LIBRE'
-
-    for (let i = 0; i < regles.length; i++) {
-      const regle = regles[i]
-
-      if (regle.trigger_condition === 'ALWAYS') {
-        regleAppliquee = regle
-        break
-      }
-      if (regle.trigger_condition === 'BUSY'
-          && statut === 'OCCUPE') {
-        regleAppliquee = regle
-        break
-      }
-      if (regle.trigger_condition === 'NO_ANSWER'
-          && statut === 'SANS_REPONSE') {
-        regleAppliquee = regle
-        break
-      }
-    }
-
-    // Aucune règle applicable → sonner
-    if (!regleAppliquee) {
-      return res.status(200).json({
-        message     : 'Aucune règle applicable',
-        decision    : 'RING',
-        destination : numeroAppele
-      })
-    }
-
-    return res.status(200).json({
-      message     : 'Règle appliquée',
-      decision    : regleAppliquee.action,
-      destination : regleAppliquee.target_number || numeroAppele,
-      regle       : regleAppliquee
-    })
-
-  } catch (error) {
-    console.error('Erreur evaluerAppel :', error)
-    return res.status(500).json({
-      erreur : 'Erreur serveur',
-      detail : error.message
+  if (resultat.raison === 'NUMERO_INCONNU_OU_INACTIF') {
+    return res.status(404).json({
+      erreur: 'Numéro DID introuvable ou inactif',
+      decision: resultat.decision,
+      codeSIP: resultat.codeSIP
     })
   }
+
+  const messages = {
+    REGLE_APPLIQUEE: 'Règle appliquée',
+    AUCUNE_REGLE: 'Aucune règle configurée',
+    AUCUNE_REGLE_APPLICABLE: 'Aucune règle applicable'
+  }
+  return res.status(200).json({
+    message: messages[resultat.raison],
+    decision: resultat.decision,
+    destination: resultat.destination,
+    codeSIP: resultat.codeSIP,
+    regle: resultat.regle
+  })
 }
 
 // ════════════════════════════════════════════
-// DELETE /api/forwarding/rules/:ruleId
-// Supprimer une règle
+// DELETE /api/forwarding/rules/:ruleId  (désactivation)
 // ════════════════════════════════════════════
 const supprimerRegle = async (req, res) => {
-  try {
-    const { ruleId } = req.params
+  const ruleId = v.identifiant(req.params.ruleId, 'ruleId')
 
-    const { error } = await supabase
+  const regles = donnees(
+    await supabase
       .from('forwarding_rule')
       .update({ is_active: false })
       .eq('rule_id', ruleId)
+      .select('rule_id, user_id'),
+    'désactivation de la règle'
+  ) || []
+  if (regles.length === 0) throw introuvable('Règle introuvable')
+  invaliderCacheRegles(regles[0].user_id)
 
-    if (error) {
-      return res.status(500).json({
-        erreur : 'Erreur suppression règle',
-        detail : error.message
-      })
-    }
-
-    return res.status(200).json({
-      message : 'Règle désactivée avec succès'
-    })
-
-  } catch (error) {
-    return res.status(500).json({
-      erreur : 'Erreur serveur',
-      detail : error.message
-    })
-  }
+  return res.status(200).json({ message: 'Règle désactivée avec succès' })
 }
 
 module.exports = {
   creerRegle,
   getRegles,
+  modifierRegle,
   evaluerAppel,
   supprimerRegle
 }

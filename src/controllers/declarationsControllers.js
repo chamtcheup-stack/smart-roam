@@ -1,193 +1,98 @@
+'use strict'
+
 const supabase = require('../supabase')
-const { attribuerNumeroDID } = require('../algorithms/algo15_attributionDID')
+const v = require('../utils/validation')
+const { introuvable, requeteInvalide, conflit } = require('../utils/http')
+const { donnees, paginer, executerSansEchec } = require('../utils/db')
+const { declarerDestination: declarer } = require('../algorithms/algo20_declarationDestination')
 
 // ════════════════════════════════════════════
-// POST /api/declarations/new
+// POST /api/declarations/new   (en-tête Idempotency-Key recommandé)
+// Déclarer un voyage (algo 20 → attribution du numéro, algo 15)
 // ════════════════════════════════════════════
 const declarerDestination = async (req, res) => {
-  try {
-    const { userId, paysISO, dateDepart, dateRetour } = req.body
+  v.exigerChamps(req.body, ['userId', 'paysISO', 'dateDepart'])
+  const userId = v.identifiant(req.body.userId, 'userId')
+  const paysISO = v.paysISO(req.body.paysISO, 'paysISO')
+  const dateDepart = v.date(req.body.dateDepart, 'dateDepart')
+  const dateRetour = v.date(req.body.dateRetour, 'dateRetour', { optionnel: true }) || null
 
-    // Vérifier les champs obligatoires
-    if (!userId || !paysISO || !dateDepart) {
-      return res.status(400).json({
-        erreur : 'Champs manquants',
-        requis : ['userId', 'paysISO', 'dateDepart']
-      })
-    }
+  const resultat = await declarer({ userId, paysISO, dateDepart, dateRetour })
 
-    // Vérifier que le pays existe
-    const { data: pays, error: paysError } = await supabase
-      .from('country')
-      .select('*')
-      .eq('country_iso', paysISO)
-      .eq('did_enabled', true)
-      .single()
-
-    if (paysError || !pays) {
-      return res.status(400).json({
-        erreur : 'Ce pays nest pas supporté par Smart Roam',
-        pays   : paysISO
-      })
-    }
-
-    // Vérifier si déclaration déjà active
-    const { data: existant } = await supabase
-      .from('trip_declaration')
-      .select('*')
-      .eq('user_id', userId)
-      .eq('destination_country', paysISO)
-      .eq('status', 'PENDING')
-      .single()
-
-    if (existant) {
-      return res.status(200).json({
-        message     : 'Déclaration déjà active pour ce pays',
-        declaration : existant
-      })
-    }
-
-    // Appeler algo n°15 pour attribuer un numéro
-    const numeroVirtuel = await attribuerNumeroDID(userId, paysISO)
-
-    if (!numeroVirtuel) {
-      return res.status(400).json({
-        erreur : 'Aucun numéro disponible pour ce pays'
-      })
-    }
-
-    // Créer la déclaration
-    const { data: declaration, error: declError } = await supabase
-      .from('trip_declaration')
-      .insert([{
-        user_id             : userId,
-        destination_country : paysISO,
-        departure_date      : dateDepart,
-        return_date         : dateRetour || null,
-        status              : 'PENDING',
-        number_id           : numeroVirtuel.number_id,
-        vault_prepared      : false
-      }])
-      .select()
-      .single()
-
-    if (declError) {
-      return res.status(500).json({
-        erreur : 'Erreur création déclaration',
-        detail : declError.message
-      })
-    }
-
-    // Enregistrer dans l'historique
-    await supabase
-      .from('travel_history')
-      .insert([{
-        user_id              : userId,
-        country_iso          : paysISO,
-        declared_destination : paysISO,
-        declaration_time     : new Date(),
-        detection_method     : 'MANUAL'
-      }])
-
-    return res.status(201).json({
-      message       : 'Déclaration enregistrée avec succès',
-      declaration   : declaration,
-      numeroVirtuel : numeroVirtuel,
-      pays          : pays.name_fr
-    })
-
-  } catch (error) {
-    console.error('Erreur declarerDestination :', error)
-    return res.status(500).json({
-      erreur : 'Erreur serveur',
-      detail : error.message
+  if (resultat.statut === 'EXISTANTE') {
+    return res.status(200).json({
+      message: 'Déclaration déjà active pour ce pays',
+      declaration: resultat.declaration
     })
   }
+
+  return res.status(201).json({
+    message: 'Déclaration enregistrée avec succès',
+    declaration: resultat.declaration,
+    numeroVirtuel: resultat.numeroVirtuel,
+    pays: resultat.pays.name_fr || paysISO
+  })
 }
 
 // ════════════════════════════════════════════
 // GET /api/declarations/:userId
 // ════════════════════════════════════════════
 const getDeclarations = async (req, res) => {
-  try {
-    const { userId } = req.params
-
-    const { data, error } = await supabase
+  const page = v.pagination(req.query)
+  const { lignes, total } = await paginer(
+    supabase
       .from('trip_declaration')
-      .select('*')
-      .eq('user_id', userId)
-      .order('declaration_time', { ascending: false })
+      .select('*', { count: 'exact' })
+      .eq('user_id', req.params.userId)
+      .order('declaration_time', { ascending: false }),
+    page,
+    'lecture des déclarations'
+  )
 
-    if (error) {
-      return res.status(500).json({
-        erreur : 'Erreur lecture déclarations',
-        detail : error.message
-      })
-    }
-
-    return res.status(200).json({
-      declarations : data,
-      total        : data.length
-    })
-
-  } catch (error) {
-    return res.status(500).json({
-      erreur : 'Erreur serveur',
-      detail : error.message
-    })
-  }
+  return res.status(200).json({ declarations: lignes, total, ...page })
 }
 
 // ════════════════════════════════════════════
 // PUT /api/declarations/:declarationId/cancel
 // ════════════════════════════════════════════
 const annulerDeclaration = async (req, res) => {
-  try {
-    const { declarationId } = req.params
+  const declarationId = v.identifiant(req.params.declarationId, 'declarationId')
 
-    const { data: existant } = await supabase
-      .from('trip_declaration')
-      .select('*')
-      .eq('declaration_id', declarationId)
-      .single()
+  const existante = donnees(
+    await supabase.from('trip_declaration').select('*').eq('declaration_id', declarationId).maybeSingle(),
+    'lecture de la déclaration'
+  )
+  if (!existante) throw introuvable('Déclaration introuvable')
+  if (existante.status === 'COMPLETED') throw requeteInvalide('Impossible d\'annuler un voyage terminé')
+  if (existante.status === 'CANCELLED') {
+    return res.status(200).json({ message: 'Déclaration déjà annulée', declaration: existante })
+  }
 
-    if (!existant) {
-      return res.status(404).json({
-        erreur : 'Déclaration introuvable'
-      })
-    }
-
-    if (existant.status === 'COMPLETED') {
-      return res.status(400).json({
-        erreur : 'Impossible dannuler un voyage terminé'
-      })
-    }
-
-    const { data, error } = await supabase
+  // Mise à jour conditionnelle : aucun changement concurrent de statut écrasé.
+  const lignes = donnees(
+    await supabase
       .from('trip_declaration')
       .update({ status: 'CANCELLED' })
       .eq('declaration_id', declarationId)
-      .select()
-      .single()
+      .eq('status', existante.status)
+      .select(),
+    'annulation de la déclaration'
+  ) || []
+  if (lignes.length === 0) throw conflit('La déclaration a été modifiée entre-temps : réessayez')
 
-    if (error) {
-      return res.status(500).json({
-        erreur : 'Erreur annulation',
-        detail : error.message
-      })
-    }
-
-    return res.status(200).json({
-      message     : 'Déclaration annulée',
-      declaration : data
-    })
-
-  } catch (error) {
-    return res.status(500).json({
-      erreur : 'Erreur serveur',
-      detail : error.message
-    })
+  // Le numéro reste la propriété de l'utilisateur mais ne reçoit plus d'appels.
+  if (existante.number_id) {
+    await executerSansEchec(
+      supabase
+        .from('virtual_number')
+        .update({ status: 'PARKED' })
+        .eq('number_id', existante.number_id)
+        .in('status', ['AWAITING_ARRIVAL', 'ACTIVE']),
+      'mise en parking du numéro après annulation'
+    )
   }
+
+  return res.status(200).json({ message: 'Déclaration annulée', declaration: lignes[0] })
 }
 
 module.exports = {

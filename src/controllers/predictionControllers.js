@@ -1,140 +1,113 @@
+'use strict'
+
 const supabase = require('../supabase')
+const v = require('../utils/validation')
+const { introuvable } = require('../utils/http')
+const { donnees, paginer } = require('../utils/db')
+const {
+  predictionPreAtterrissage,
+  enregistrerSuggestionRefusee
+} = require('../algorithms/algo06_predictionAtterrissage')
+
+const enPourcentage = (probabilite) => `${(probabilite * 100).toFixed(1)}%`
+
+const MESSAGES_SANS_SUGGESTION = {
+  HISTORIQUE_INSUFFISANT: 'Historique insuffisant pour prédire',
+  PROBABILITE_INSUFFISANTE: 'Probabilité insuffisante pour suggérer',
+  AUCUNE_DESTINATION: 'Aucune destination à suggérer'
+}
 
 // ════════════════════════════════════════════
 // POST /api/prediction/suggest
-// Suggérer une destination selon l'historique
+// Suggérer une destination selon l'historique (algo 06)
 // ════════════════════════════════════════════
 const suggererDestination = async (req, res) => {
-  try {
-    const { userId } = req.body
+  const userId = v.identifiant(req.body.userId, 'userId')
 
-    if (!userId) {
-      return res.status(400).json({
-        erreur : 'userId obligatoire'
-      })
-    }
+  const utilisateur = donnees(
+    await supabase.from('users').select('country_of_residence, deleted_at').eq('user_id', userId).maybeSingle(),
+    'lecture du pays de résidence'
+  )
+  if (!utilisateur || utilisateur.deleted_at) throw introuvable('Utilisateur introuvable')
 
-    // Récupérer l'historique des 24 derniers mois
-    const dateLimit = new Date()
-    dateLimit.setMonth(dateLimit.getMonth() - 24)
+  const resultat = await predictionPreAtterrissage(userId, { paysOrigine: utilisateur.country_of_residence })
 
-    const { data: historique, error } = await supabase
-      .from('travel_history')
-      .select('*')
-      .eq('user_id', userId)
-      .gte('arrival_detected_at', dateLimit.toISOString())
-
-    if (error) {
-      return res.status(500).json({
-        erreur : 'Erreur lecture historique',
-        detail : error.message
-      })
-    }
-
-    // Minimum 3 voyages pour prédire
-    if (!historique || historique.length < 3) {
-      return res.status(200).json({
-        message       : 'Historique insuffisant pour prédire',
-        suggestion    : null,
-        totalVoyages  : historique ? historique.length : 0,
-        minimumRequis : 3
-      })
-    }
-
-    // Compter les destinations
-    const compteur = {}
-    historique.forEach(voyage => {
-      const pays = voyage.country_iso
-      if (pays) {
-        compteur[pays] = (compteur[pays] || 0) + 1
-      }
-    })
-
-    // Trouver la destination la plus fréquente
-    let meilleureDestination = null
-    let maxVoyages           = 0
-
-    Object.keys(compteur).forEach(pays => {
-      if (compteur[pays] > maxVoyages) {
-        maxVoyages           = compteur[pays]
-        meilleureDestination = pays
-      }
-    })
-
-    const probabilite = maxVoyages / historique.length
-
-    // Seuil de 60% pour suggérer
-    if (probabilite < 0.60) {
-      return res.status(200).json({
-        message    : 'Probabilité insuffisante pour suggérer',
-        suggestion : null,
-        probabilite : parseFloat((probabilite * 100).toFixed(1)) + '%'
-      })
-    }
-
-    // Récupérer le nom du pays
-    const { data: pays } = await supabase
-      .from('country')
-      .select('name_fr')
-      .eq('country_iso', meilleureDestination)
-      .single()
-
+  if (!resultat.suggestion) {
     return res.status(200).json({
-      message         : 'Destination suggérée',
-      suggestion      : {
-        paysISO     : meilleureDestination,
-        nomPays     : pays ? pays.name_fr : meilleureDestination,
-        probabilite : parseFloat((probabilite * 100).toFixed(1)) + '%',
-        nbVoyages   : maxVoyages
-      },
-      totalVoyages    : historique.length,
-      instruction     : 'Confirmez avec POST /api/declarations/new'
-    })
-
-  } catch (error) {
-    console.error('Erreur suggererDestination :', error)
-    return res.status(500).json({
-      erreur : 'Erreur serveur',
-      detail : error.message
+      message: MESSAGES_SANS_SUGGESTION[resultat.raison],
+      suggestion: null,
+      totalVoyages: resultat.totalVoyages,
+      ...(resultat.minimumRequis ? { minimumRequis: resultat.minimumRequis } : {}),
+      ...(resultat.meilleure ? { probabilite: enPourcentage(resultat.meilleure.probabilite) } : {})
     })
   }
+
+  const { suggestion } = resultat
+  const pays = donnees(
+    await supabase.from('country').select('name_fr').eq('country_iso', suggestion.pays).maybeSingle(),
+    'lecture du nom du pays'
+  )
+
+  return res.status(200).json({
+    message: 'Destination suggérée',
+    suggestion: {
+      paysISO: suggestion.pays,
+      nomPays: pays && pays.name_fr ? pays.name_fr : suggestion.pays,
+      probabilite: enPourcentage(suggestion.probabilite),
+      probabiliteValeur: Number(suggestion.probabilite.toFixed(4)),
+      nbVoyages: suggestion.nbVoyages,
+      scores: {
+        frequence: Number(suggestion.scoreFrequence.toFixed(3)),
+        saison: Number(suggestion.scoreSaison.toFixed(3)),
+        jourSemaine: Number(suggestion.scoreJourSemaine.toFixed(3))
+      }
+    },
+    totalVoyages: resultat.totalVoyages,
+    instruction: 'Confirmez avec POST /api/declarations/new ou refusez avec POST /api/prediction/feedback'
+  })
 }
 
 // ════════════════════════════════════════════
 // GET /api/prediction/history/:userId
-// Récupérer l'historique des voyages
 // ════════════════════════════════════════════
 const getHistoriqueVoyages = async (req, res) => {
-  try {
-    const { userId } = req.params
-
-    const { data, error } = await supabase
+  const page = v.pagination(req.query)
+  const { lignes, total } = await paginer(
+    supabase
       .from('travel_history')
-      .select('*')
-      .eq('user_id', userId)
-      .order('arrival_detected_at', { ascending: false })
+      .select('*', { count: 'exact' })
+      .eq('user_id', req.params.userId)
+      .order('arrival_detected_at', { ascending: false }),
+    page,
+    'lecture de l\'historique de voyage'
+  )
 
-    if (error) {
-      return res.status(500).json({
-        erreur : 'Erreur lecture historique',
-        detail : error.message
-      })
-    }
+  return res.status(200).json({ historique: lignes, total, ...page })
+}
 
-    return res.status(200).json({
-      historique : data,
-      total      : data.length
-    })
+// ════════════════════════════════════════════
+// POST /api/prediction/feedback
+// Réponse de l'utilisateur à une suggestion : { paysISO, acceptee }
+// ════════════════════════════════════════════
+const enregistrerRetourSuggestion = async (req, res) => {
+  v.exigerChamps(req.body, ['userId', 'paysISO', 'acceptee'])
+  const userId = v.identifiant(req.body.userId, 'userId')
+  const paysISO = v.paysISO(req.body.paysISO, 'paysISO')
+  const acceptee = v.booleen(req.body.acceptee, 'acceptee')
 
-  } catch (error) {
-    return res.status(500).json({
-      erreur : 'Erreur serveur',
-      detail : error.message
-    })
-  }
+  if (!acceptee) await enregistrerSuggestionRefusee(userId, paysISO)
+
+  return res.status(200).json({
+    message: acceptee
+      ? 'Suggestion acceptée : confirmez votre voyage avec POST /api/declarations/new'
+      : 'Suggestion refusée : elle sera prise en compte pour les prochaines prédictions',
+    paysISO,
+    acceptee
+  })
 }
 
 module.exports = {
   suggererDestination,
-  getHistoriqueVoyages
+  getHistoriqueVoyages,
+  enregistrerRetourSuggestion
 }

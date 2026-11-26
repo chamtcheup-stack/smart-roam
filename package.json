@@ -1,16 +1,16 @@
 {
   "name": "smart_roam",
   "version": "1.0.0",
-  "imports": {
-    "#models/*": "./src/models/*",
-    "#config/*": "./src/config/*",
-    "#services/*": "./src/services/*"
-  },
-  "description": "",
-  "main": "index.js",
+  "private": true,
+  "description": "API backend Smart Roam : numéros virtuels, eSIM, roaming, conversion de devises",
+  "main": "server.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "node server.js"
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "node --test \"test/**/*.test.js\""
+  },
+  "engines": {
+    "node": ">=22"
   },
   "keywords": [],
   "author": "",
@@ -20,7 +20,7 @@
     "@supabase/supabase-js": "^2.105.4",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
-    "express": "^5.2.1"
-  },
-  "devDependencies": {}
+    "express": "^5.2.1",
+    "jsonwebtoken": "^9.0.3"
+  }
 }

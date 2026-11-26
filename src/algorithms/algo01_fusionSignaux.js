@@ -1,302 +1,181 @@
-const supabase = require ('../supabase')
+'use strict'
 
-const attendre = (secondes) => new Promise((resolve) => setTimeout(resolve, secondes * 1000));
+// ════════════════════════════════════════════════════════════
+// ALGO 01 — Fusion multi-signaux (géofencing d'arrivée / de retour)
+//
+// À partir des signaux envoyés par l'application (MCC/MNC, Cell-ID,
+// Wi-Fi, IP), scorés par l'algo 08 :
+//   - arrivée dans le pays déclaré (score ≥ 70)  → numéro virtuel activé
+//   - retour dans le pays d'origine (score ≥ 70) → mode parking
+//   - score intermédiaire (50–69)                → attente d'un signal
+//   - autre pays                                  → escale ignorée
+// Le voyage actif est la dernière déclaration PENDING (arrivée attendue)
+// ou CONFIRMED (voyageur sur place, retour attendu).
+// ════════════════════════════════════════════════════════════
 
-const poidsMCCMNC = 0.40;
-const poidsCellID = 0.30;
-const poidsIP = 0.20;
-const poidsWifi = 0.10;
-const seuilActivation = 70;
-const seuilAttente = 50;
-const dureeAttente = 5;
+const supabase = require('../supabase')
+const logger = require('../utils/logger')
+const { donnees, executerSansEchec } = require('../utils/db')
+const { journaliserAudit } = require('../utils/audit')
+const {
+  SEUIL_HAUTE,
+  SEUIL_MOYENNE,
+  normaliserSignaux,
+  calculerScore,
+  determinerPaysCandidat
+} = require('./algo08_scoringConfiance')
 
-const lireDestinationDeclaree = async (userId) =>{
-    let resultat;
+const DUREE_ATTENTE_SECONDES = 5
 
-    try{
-        const {data, error} = await supabase
-        .from ('trip_declaration')
-        .select('destination_country')
-        .eq('user_id', userId)
-        .eq('status', "PENDING")
-        .limit(1)
-        .maybeSingle()
+const lireVoyageActif = async (userId) => donnees(
+  await supabase
+    .from('trip_declaration')
+    .select('*')
+    .eq('user_id', userId)
+    .in('status', ['PENDING', 'CONFIRMED'])
+    .order('declaration_time', { ascending: false })
+    .limit(1)
+    .maybeSingle(),
+  'lecture du voyage actif'
+)
 
-        if (error){
-            resultat = null;
-        } else {
-            resultat = data;
-        }
-        console.log(resultat);
+const lirePaysOrigine = async (userId) => {
+  const utilisateur = donnees(
+    await supabase.from('users').select('country_of_residence').eq('user_id', userId).maybeSingle(),
+    'lecture du pays d\'origine'
+  )
+  return utilisateur ? utilisateur.country_of_residence : null
+}
 
-    }catch (error){
-        console.error('Une erreur est survenue:', error)
-        return null;
-    }
+// ── Procédures ──────────────────────────────────────────────
+const activerNumeroVirtuel = async (userId, paysDestination) => {
+  const maintenant = new Date().toISOString()
 
-    if (resultat != null){
-        return resultat.destination_country;
-    } else {
-        return null;
-    }
-};
+  donnees(
+    await supabase
+      .from('trip_declaration')
+      .update({ status: 'CONFIRMED', arrival_confirmed_at: maintenant })
+      .eq('user_id', userId)
+      .eq('destination_country', paysDestination)
+      .eq('status', 'PENDING'),
+    'confirmation de l\'arrivée'
+  )
 
+  const numeros = donnees(
+    await supabase
+      .from('virtual_number')
+      .update({ status: 'ACTIVE', activated_at: maintenant })
+      .eq('user_id', userId)
+      .eq('country_iso', paysDestination)
+      .eq('status', 'AWAITING_ARRIVAL')
+      .select('number_id'),
+    'activation du numéro virtuel'
+  )
 
-const lirePaysOrigine = async (userId) =>{
-    let resultat;
+  // Historique : date d'arrivée réelle (alimente la prédiction, algo 06).
+  await executerSansEchec(
+    supabase
+      .from('travel_history')
+      .update({ arrival_detected_at: maintenant, detection_method: 'AUTO' })
+      .eq('user_id', userId)
+      .eq('country_iso', paysDestination)
+      .is('arrival_detected_at', null),
+    'historique d\'arrivée'
+  )
 
-    try{
-        const {data, error} =await supabase
-        .from('users')
-        .select('country_of_residence')
-        .eq('user_id', userId)
-        .single()
+  logger.info('Arrivée confirmée : numéro virtuel activé', { userId, paysDestination, numeros: (numeros || []).length })
+  return (numeros || []).length
+}
 
-        if (error){
-            resultat = null;
-        } else {
-            resultat = data;
-        }
-        console.log(resultat);
+const activerModeParking = async (userId, paysOrigine) => {
+  const maintenant = new Date().toISOString()
 
-    } catch (error){
-        console.error("Une erreur réseau ou système est survenue:",error)
-        return null;
-    }
+  const numeros = donnees(
+    await supabase
+      .from('virtual_number')
+      .update({ status: 'PARKED' })
+      .eq('user_id', userId)
+      .eq('status', 'ACTIVE')
+      .neq('country_iso', paysOrigine)
+      .select('number_id'),
+    'mise en parking des numéros'
+  )
 
-    if (resultat != null){
-        return resultat.country_of_residence;
-    } else {
-        return null;
-    }
-};
+  donnees(
+    await supabase
+      .from('trip_declaration')
+      .update({ status: 'COMPLETED', return_confirmed_at: maintenant })
+      .eq('user_id', userId)
+      .eq('status', 'CONFIRMED'),
+    'clôture du voyage'
+  )
 
+  logger.info('Retour détecté : mode parking activé', { userId, numeros: (numeros || []).length })
+  return (numeros || []).length
+}
 
-const calculerScoreCellID =  (signalCellID, paysDestination) =>{
-    let score;
+// ── Traitement principal ────────────────────────────────────
+const fusionMultiSignaux = async (userId, signaux) => {
+  const voyage = await lireVoyageActif(userId)
+  if (!voyage) {
+    return { decision: 'SURVEILLANCE', raison: 'AUCUN_VOYAGE_ACTIF', scoreConfiance: 0 }
+  }
 
-    if (signalCellID === null){
-        return 0;
-    }
-    score = poidsCellID * 100;
-    return score;
-};
+  const paysDestination = voyage.destination_country
+  const paysOrigine = await lirePaysOrigine(userId)
+  const signauxNormalises = normaliserSignaux(signaux)
+  const paysDetecte = determinerPaysCandidat(signauxNormalises)
 
+  const scoreDestination = calculerScore(signauxNormalises, paysDestination)
+  const scoreOrigine = paysOrigine ? calculerScore(signauxNormalises, paysOrigine) : { scoreFinal: 0 }
+  const enVoyage = voyage.status === 'CONFIRMED'
 
-const calculerScoreMCCMNC = (signalMCCMNC, paysDestinatio) =>{
-    let score;
+  const contexte = { paysDestination, paysOrigine, paysDetecte, statutVoyage: voyage.status }
+  const journaliser = (decision, score) => void journaliserAudit({
+    userId,
+    entite: 'GEOFENCING',
+    action: `${decision}_SCORE_${score}_PAYS_${paysDetecte || 'INCONNU'}`
+  })
 
-    if (signatMCCMNC === null){
-        return 0;
-    }
+  // 1. Arrivée dans le pays déclaré
+  if (!enVoyage && paysDetecte === paysDestination && scoreDestination.scoreFinal >= SEUIL_HAUTE) {
+    const numerosActives = await activerNumeroVirtuel(userId, paysDestination)
+    journaliser('ARRIVEE_CONFIRMEE', scoreDestination.scoreFinal)
+    return { decision: 'ARRIVEE_CONFIRMEE', scoreConfiance: scoreDestination.scoreFinal, numerosActives, ...contexte }
+  }
 
-    if (signalMCCMNC.confiance === 100) {
-        score = poidsMCCMNC * 100;
-    }
+  // 2. Retour dans le pays d'origine
+  if (enVoyage && paysOrigine && paysDetecte === paysOrigine && scoreOrigine.scoreFinal >= SEUIL_HAUTE) {
+    const numerosParkes = await activerModeParking(userId, paysOrigine)
+    journaliser('RETOUR_DETECTE', scoreOrigine.scoreFinal)
+    return { decision: 'RETOUR_DETECTE', scoreConfiance: scoreOrigine.scoreFinal, numerosParkes, ...contexte }
+  }
 
-    if (signalMCCMNC.confiance === 80){
-        score = poidsMCCMNC * 80;
-    }
-    return score;
-};
+  // Voyageur déjà arrivé qui renvoie des signaux depuis la destination
+  if (enVoyage && paysDetecte === paysDestination && scoreDestination.scoreFinal >= SEUIL_HAUTE) {
+    return { decision: 'DEJA_SUR_PLACE', scoreConfiance: scoreDestination.scoreFinal, ...contexte }
+  }
 
+  const scorePertinent = Math.max(scoreDestination.scoreFinal, scoreOrigine.scoreFinal)
 
-const calculerScoreWifi = (signalWifi, paysDestination) =>{
-    let score;
+  // 3. Score intermédiaire : le client renvoie ses signaux quelques secondes plus tard
+  if (scorePertinent >= SEUIL_MOYENNE && scorePertinent < SEUIL_HAUTE) {
+    return { decision: 'ATTENTE_SIGNAL_SUPPLEMENTAIRE', scoreConfiance: scorePertinent, reessayerDansSecondes: DUREE_ATTENTE_SECONDES, ...contexte }
+  }
 
-    if (signalWifi === null){
-        return 0;
-    }
-    
-    if (signalWifi.aeroports === true){
-        score = poidsWifi * 100;
-    } else {
-        score = 0;
-    }
-    return score;
-};
+  // 4. Pays sans rapport avec le voyage (escale probable)
+  if (paysDetecte && paysDetecte !== paysDestination && paysDetecte !== paysOrigine) {
+    logger.debug('Signal ignoré : pays non pertinent (escale probable)', { userId, paysDetecte })
+    return { decision: 'ESCALE_IGNOREE', scoreConfiance: scorePertinent, ...contexte }
+  }
 
+  // 5. Score trop faible
+  return { decision: 'SCORE_INSUFFISANT', scoreConfiance: scorePertinent, ...contexte }
+}
 
-const calculerScoreIP = (signalIP, paysDestination) =>{
-    let score
-
-    if (signalIP === null){
-        return 0;
-    }
-
-    if (signalIP === paysDestination){
-        score = poidsIP * 100;
-    } else {
-        score = 0;
-    }
-    return score;
-};
-
-
-const fusionnerScores = (scoreCellID, scoreMCCMNC, scoreWifi, scoreIP) =>{
-    let scoreFinal
-
-    scoreFinal = scoreCellID + scoreMCCMNC + scoreWifi + scoreIP;
-
-    if (scoreFinal > 100){
-        scoreFinal = 100
-    }
-    return scoreFinal;
-};
-
-
-const determinerPaysDetecte = (signalMCCMNC, signalWifi, signalIP) =>{
-
-
-    if (signalMCCMNC != null){
-        return signalMCCMNC.paysISO
-    }
-
-    if ((signalWifi != null) && (signalWifi.aeroports === true)){
-        return signalWifi.paysISO;
-    }
-
-    if (signalIP != null){
-        return signalIP;
-    }
-
-    return null;
-};
-
-// procédures
-const activerNumeroVirtuel = async (userId, paysDestination) =>{
-
-    try{
-        const {data, error} = await supabase
-    
-        .from('trip_declaration')
-        .update({
-            status: "CONFIRMED",
-            arrival_confirmed_at: new Date().toISIString(),
-        })
-        .eq('user_id', userId)
-        .eq('destination_country', paysDestination)
-        .eq('status', "PENDING")
-
-        if (tripError) throw tripError;
-        const {data, error} = await supabase
-        .from('virtual_number')
-        .update({
-            status: "Active",
-            activated_at: new Date().toISOString(),
-        })
-        .eq('user_id', userId)
-        .eq('country_iso', paysDestination)
-        .eq('status', 'AWAITING_ARRIVAL')
-        if (numberError) throw numberError;
-        return {success : true}
-    } catch (error){
-        console.error('Une erreur réseau ou système est survenue:', error)
-        return null;
-    }
-
-    console.log("Numéro activé pour" + userId + "dans" + paysDestination);
-};
-
-
-const activerModeParking = async (userId, paysOrigine) =>{
-
-    try{
-        const{data, error} = await supabase
-        .from('virtual_number')
-        .update({
-            statut: "PARKED",
-            suspended_at: new Date().toISOString(),
-        })
-        .eq('user_id', userId)
-        .eq('country_iso' != paysOrigine)
-        .eq('status', "ACTIVE")
-
-        if (tripError) throw tripError;
-        const {data, error} = await supabase
-        .from('trip_declaration')
-        .update({
-            status: "COMPLETED",
-            return_confirmed_at: new Date().toISOString(),
-        })
-        .eq('user_id', userId)
-        .eq('status', "CONFIRMED")
-        if (numberError) throw numberError;
-        console.log("Mode Parking activé pour " + userId);
-        return {success : true}
-    } catch (error){
-        console.error('Une erreur réseau ou système est survenue:', error)
-        return null;
-    }
-};
-
-
-const attendreSignalSupplementaire = async (userId, duree) =>{
-
-    console.log("Score insuffisant-attente de" + duree + "secondes");
-    await attendre(duree)
-    console.log("Reprise de l'analyse des signaux");
-};
-
-
-const ignorerSignal = (paysDetecte, raison) =>{
-
-    console.log("Signal ignoré-pays détecté :" + paysDetecte + "Raison" + raison)
-};
-
-// traitement principal
-const fusionMultiSignaux = (userId, cellID, signalMCCMNC, signalWifi, signalIP) =>{
-    let paysDestination;
-    let paysOrigine;
-    let scoreCellID;
-    let scoreMCCMNC;
-    let scoreWifi;
-    let scoreIP;
-    let scoreConfiance;
-    let paysDetecte;
-    let decision;
-
-    paysDestination = await lireDestinationDeclaree(userId)
-    paysOrigine = await lirePaysOrigine(userId)
-    if (paysDestination ===null){
-        console.log("Aucune déclaration de voyage active")
-        console.log("Géofencing en mode surveillance uniquement")
-        return null;
-    }
-
-    scoreCellID = calculerScoreCellID(signalCellID, paysDestination)
-    scoreMCCMNC = calculerScoreMCCMNC(signalMCCMNC, paysDestination)
-    scoreWifi = calculerScoreWifi(signalWifi, paysDestination);
-    scoreIP = calculerScoreIP(signalIP, paysDestination)
-    scoreConfiance = fusionnerScore(signalCellID, signalMCCMNC, signalWifi, signalIP)
-    paysDetecte = determinerPaysDetecter(signalMCCMNC, signalWifi, signalIP)
-
-    if ((paysDetecte === paysDestination) && (scoreConfiance >= seuilActivation)){
-        decision = "ARRIVEE_CONFIRMEE"
-        await activerNumeroVirtuel(userId, paysDestination)
-        return decision;
-    }
-
-    if ((paysDetecte === paysOrigine) && (scoreConfiance >= seuilActivation)){
-        decision = "RETOUR_DETECTEE"
-        await activerModeParking(userId, paysOrigine)
-        return decision
-    }
-
-    if ((scoreConfiance >= seuilAttente) && (scoreConfiance < seuilActivation)){
-        await attendreSignalSupplementaire(userId, dureeAttente)
-        return null;
-    }
-
-    if ((paysDetecte != paysDestination) && (paysDetecte != paysOrigine)){
-        ignorerSignal(paysDetecte)
-        console.log("pays non pertinent, probablement une escale")
-        return null;
-    }
-
-    if (scoreConfiance < seuilAttente){
-        ignorerSignal(paysDetecte)
-        console.log("Score trop faible" + scoreConfiance + "/100")
-        return null;
-    }
-};
+module.exports = {
+  fusionMultiSignaux,
+  lireVoyageActif,
+  activerNumeroVirtuel,
+  activerModeParking
+}

@@ -1,313 +1,153 @@
-const supabase = require ('../supabase')
+'use strict'
 
-const seuilSuggestion = 0.60
-const moisHistorique = 24
-const minimumVoyage = 3
-const poidsFrequence = 0.50
-const poidsSaison = 0.30
-const poidsJousSemaine = 0.20
+// ════════════════════════════════════════════════════════════
+// ALGO 06 — Prédiction de destination avant l'atterrissage
+//
+// Sur les 24 derniers mois d'historique (minimum 3 voyages), pour chaque
+// destination hors pays d'origine :
+//   probabilité = 50 % fréquence + 30 % saisonnalité (mois ± 1, circulaire)
+//               + 20 % jour de la semaine
+// Suggestion proposée si probabilité ≥ 60 %. Le client confirme (déclaration)
+// ou refuse (enregistrerSuggestionRefusee) : pas d'interaction bloquante.
+// ════════════════════════════════════════════════════════════
 
-const extraireMois = (dateString) => {
-    const date = new Date(dateString);
-    return date.getMonth() + 1; // 1 (Janvier) à 12 (Décembre)
-};
+const supabase = require('../supabase')
+const { donnees } = require('../utils/db')
+const { journaliserAudit } = require('../utils/audit')
 
-const extraireJourSemaine = (dateString) => {
-    const date = new Date(dateString);
-    const day = date.getDay();
-    return day === 0 ? 7 : day; // 1 (Lundi) à 7 (Dimanche)
-};
+const SEUIL_SUGGESTION = 0.60
+const MOIS_HISTORIQUE = 24
+const MINIMUM_VOYAGES = 3
+const POIDS_FREQUENCE = 0.50
+const POIDS_SAISON = 0.30
+const POIDS_JOUR_SEMAINE = 0.20
 
-const recupererHistoriqueVoyage = async (userId, nbMois) =>{
-    let resultat = []
+const dateVoyage = (voyage) => voyage.arrival_detected_at || voyage.declaration_time || voyage.created_at || null
 
-    try {
-        const dateLimite = new Date();
-        dateLimite.setMonth(dateLimite.getMonth() - nbMois);
+const extraireMois = (date) => new Date(date).getUTCMonth() + 1 // 1 (janvier) à 12 (décembre)
 
-        const{data, error} = await supabase
-        .from('travel_history')
-        .select('*')
-        .eq('user_id', userId)
-        .gte('arrival_detected_at' >= dateLimite.toISOString() )
-        .order('arrivaldetected_at', {descending: true})
-
-        if (error){
-            resultat = null
-        } else {
-            resultat  = data
-        }
-        console.log(resultat)
-    } catch (error){
-        console.error("Une erreur est survenue lors de la récupération de l'historique:", error)
-        return []
-    }
-
-    if (resultat != null){
-        return resultat
-    } else {
-        return []
-    }
+const extraireJourSemaine = (date) => {
+  const jour = new Date(date).getUTCDay()
+  return jour === 0 ? 7 : jour // 1 (lundi) à 7 (dimanche)
 }
 
-const compterVoyageParDestination = (historiqueVoyages, paysISO) =>{
-    let compteur
-    let i 
-
-    i = 0
-    compteur = 0
-    while (i < historiqueVoyages.length){
-        if (historiqueVoyages[i].country_iso === paysISO){
-            compteur = compteur + 1
-        }
-        i = i + 1
-    }
-    return compteur
+// Distance circulaire entre deux mois : décembre et janvier sont voisins.
+const ecartMois = (mois1, mois2) => {
+  const ecart = Math.abs(mois1 - mois2)
+  return Math.min(ecart, 12 - ecart)
 }
 
-const calculerScoreFrequence = (nbVoyagePays, nbVoyagesTotal) =>{
-     
+// Voyages des nbMois derniers mois : arrivée détectée OU déclaration manuelle.
+const recupererHistoriqueVoyage = async (userId, nbMois = MOIS_HISTORIQUE, maintenant = new Date()) => {
+  const dateLimite = new Date(maintenant)
+  dateLimite.setUTCMonth(dateLimite.getUTCMonth() - nbMois)
+  const limiteISO = dateLimite.toISOString()
 
-    if (nbVoyagesTotal === 0){
-        return 0
-    }
-    const score = nbVoyagesPays / nbVoyagesTotal
-    return score 
-
+  const voyages = donnees(
+    await supabase
+      .from('travel_history')
+      .select('*')
+      .eq('user_id', userId)
+      .or(`arrival_detected_at.gte.${limiteISO},declaration_time.gte.${limiteISO}`)
+      .order('arrival_detected_at', { ascending: false }),
+    'lecture de l\'historique de voyage'
+  )
+  return (voyages || []).filter((voyage) => voyage.country_iso && dateVoyage(voyage))
 }
 
-const calculerScoreSaison = (historiqueVoyages, paysISO, moisActuel) =>{
-    let nbVoyagesMoisSimilaires
-    let nbVoyagesPays
-    let i 
+const compterVoyagesParDestination = (historique, paysISO) =>
+  historique.filter((voyage) => voyage.country_iso === paysISO).length
 
-    nbVoyagesMoisSimilaires = 0
-    nbVoyagesPays  = 0
-    i = 0
+const calculerScoreFrequence = (nbVoyagesPays, nbVoyagesTotal) =>
+  (nbVoyagesTotal === 0 ? 0 : nbVoyagesPays / nbVoyagesTotal)
 
-    while (i < historiqueVoyages.length){
-        if (historiqueVoyages[i].country_iso === pays_iso){
-            nbVoyagesPays = nbVoyagesPays + 1
-            const moisVoyage = extraireMois(histooriqueVoyages[i].arrival_detected_at)
-
-            if (Math.abs(moisVoyage - moisActuel) <= 1){
-            nbVoyagesMoisSimilaires = nbVoyagesMoisSimilaires + 1
-            }
-        }
-        i++
-    }
-
-    if (nbVoyagesPays === 0){
-        return 0
-    }
-
-    const score = nbVoyagesMoisSimilaires/ nbVoyagesPays
-    return score;
+const calculerScoreSaison = (historique, paysISO, moisActuel) => {
+  const voyagesPays = historique.filter((voyage) => voyage.country_iso === paysISO)
+  if (voyagesPays.length === 0) return 0
+  const similaires = voyagesPays.filter((voyage) => ecartMois(extraireMois(dateVoyage(voyage)), moisActuel) <= 1).length
+  return similaires / voyagesPays.length
 }
 
-const calculerScoreJourSemaine = (historiqueVoyages, paysISO, jourSemaine) =>{
-    let nbVoyagesJourSimilaire
-    let nbVoyagesPays
-    let i 
-
-    nbVoyagesJourSimilaire = 0
-    nbVoyagesPays = 0
-    i = 0
-    while (i < historiqueVoyages.length){
-        if (historiqueVoyages[i].country_iso === paysISO){
-            nbVoyagespays++
-            const jourVoyage = extraireJourSemaine(historiqueVoyages[i].arrival_detected_at)
-
-            if (jourVoyage === jourSemaine){
-            nbVoyagesJourSimilaire++
-            }
-        }
-        i++
-    }
-
-    if (nbVoyagesPays ===0){
-        return 0
-    }
-
-    const score = nbVoyagesJourSimilaire/nbVoyagesPays
-    return score 
+const calculerScoreJourSemaine = (historique, paysISO, jourSemaine) => {
+  const voyagesPays = historique.filter((voyage) => voyage.country_iso === paysISO)
+  if (voyagesPays.length === 0) return 0
+  const similaires = voyagesPays.filter((voyage) => extraireJourSemaine(dateVoyage(voyage)) === jourSemaine).length
+  return similaires / voyagesPays.length
 }
 
-const calculerProbabiliteFinale =(scoreFrequence, scoreSaison, scoreJourSemaine) =>{
-    let probabilite 
+const calculerProbabiliteFinale = (scoreFrequence, scoreSaison, scoreJourSemaine) =>
+  Math.min(1, scoreFrequence * POIDS_FREQUENCE + scoreSaison * POIDS_SAISON + scoreJourSemaine * POIDS_JOUR_SEMAINE)
 
-    probabilite = (scoreFrequence * poidsFrequence) + (scoreSaison * poidsSaison) + (scoreJourSemaine * poidsJousSemaine)
-    if (probabilite > 1){
-        probabilite = 1
-    }
-    return probabilite
+const extraireDestinationsUniques = (historique) => [...new Set(historique.map((voyage) => voyage.country_iso))]
+
+const trouverMeilleureDestination = (destinationsScorees) => destinationsScorees.reduce(
+  (meilleure, courante) => (meilleure === null || courante.probabilite > meilleure.probabilite ? courante : meilleure),
+  null
+)
+
+// Calcul pur (testable sans base).
+const scorerDestinations = (historique, paysOrigine, maintenant = new Date()) => {
+  const moisActuel = extraireMois(maintenant)
+  const jourSemaine = extraireJourSemaine(maintenant)
+  const nombreVoyages = historique.length
+
+  return extraireDestinationsUniques(historique)
+    .filter((paysISO) => paysISO !== paysOrigine)
+    .map((paysISO) => {
+      const scoreFrequence = calculerScoreFrequence(compterVoyagesParDestination(historique, paysISO), nombreVoyages)
+      const scoreSaison = calculerScoreSaison(historique, paysISO, moisActuel)
+      const scoreJourSemaine = calculerScoreJourSemaine(historique, paysISO, jourSemaine)
+      return {
+        pays: paysISO,
+        nbVoyages: compterVoyagesParDestination(historique, paysISO),
+        scoreFrequence,
+        scoreSaison,
+        scoreJourSemaine,
+        probabilite: calculerProbabiliteFinale(scoreFrequence, scoreSaison, scoreJourSemaine)
+      }
+    })
+    .sort((a, b) => b.probabilite - a.probabilite)
 }
 
-const extraireDestinationUniques = (historiqueVoyages) =>{
-    let destinations = []
-    let dejaTrouve = false
-    let i = 0
-    let j 
-    
-    
-    while (i < historiqueVoyages.length) {
-        const paysISO = historiqueVoyages[i].country_iso;
-        let dejaTrouve = false;
-        let j = 0;
+const enregistrerSuggestionRefusee = async (userId, paysISO) => journaliserAudit({
+  userId,
+  entite: 'PREDICTION',
+  action: `SUGGESTION_REFUSEE_${paysISO}`,
+  acteur: 'USER'
+})
 
-        while (j < destinations.length) {
-            if (destinations[j] === paysISO) {
-                dejaTrouve = true;
-            }
-            j = j + 1;
-        }
+// ── Traitement principal ────────────────────────────────────
+const predictionPreAtterrissage = async (userId, { paysOrigine = null, maintenant = new Date() } = {}) => {
+  const historique = await recupererHistoriqueVoyage(userId, MOIS_HISTORIQUE, maintenant)
 
-        if (dejaTrouve === false) {
-            destinations.push(paysISO);
-        }
+  if (historique.length < MINIMUM_VOYAGES) {
+    return { suggestion: null, raison: 'HISTORIQUE_INSUFFISANT', totalVoyages: historique.length, minimumRequis: MINIMUM_VOYAGES }
+  }
 
-        i = i + 1;
-    }
+  const destinationsScorees = scorerDestinations(historique, paysOrigine, maintenant)
+  const meilleure = trouverMeilleureDestination(destinationsScorees)
 
-    return destinations 
+  if (!meilleure) {
+    return { suggestion: null, raison: 'AUCUNE_DESTINATION', totalVoyages: historique.length, destinationsScorees }
+  }
+  if (meilleure.probabilite < SEUIL_SUGGESTION) {
+    return { suggestion: null, raison: 'PROBABILITE_INSUFFISANTE', meilleure, totalVoyages: historique.length, destinationsScorees }
+  }
+  return { suggestion: meilleure, raison: 'SUGGESTION', totalVoyages: historique.length, destinationsScorees }
 }
 
-const trouverMeilleureDestination = (destinationsScorees) =>{
-    let meilleure 
-    let probabiliteMax 
-    let i 
-
-    if (destinationsScorees.length === 0){
-        return null
-    }
-
-    meilleure = destinationsScorees[0]
-    probabiliteMax = destinationsScorees[0].probabilite
-    i = 1
-
-    while (i < destinationsScorees.length){
-        if (destinationsScorees[i].probabilite > probabiliteMax){
-            meilleure = destinationsScorees[i]
-            probabiliteMax = destinationsScorees[i].probabilite
-        }
-        i++
-    }
-    return meilleure
-}
-
-// procédures
-const afficherSuggestion = (paysISO, probabilite) =>{
-
-    console.log("══════════════════════════════════════")
-    console.log("SUGGESTION SMART ROAM")
-    console.log("══════════════════════════════════════")
-    console.log("Vous allez souvent en " + paysISO +" à cette période.")
-    console.log("Est-ce votre destination ?")
-    console.log("[OUI — Préparer mon voyage]")
-    console.log("[NON — Choisir une autre destination]")
-    console.log("Probabilité calculée : " + probabilite * 100 + "%")
-    console.log("══════════════════════════════════════")
-
-}
-
-const afficherEcranSelection =() =>{
-
-    console.log( "Où souhaitez-vous aller ?")
-    console.log("Sélectionnez votre destination dans la liste")
-}
-
-const enregistrerSuggestionRefusee = async (userId, paysISO) =>{
-
-    try {
-        const {data, error} = await supabase
-        .from('audit_log')
-        .insert([
-            {
-                user_id: userId,
-                entity_type: "PREDICTION",
-                action: "SUGGESTION REFUSEE" + paysISO,
-                actor_type: "SYSTEM",
-                created_at: new Date().toISOString(), 
-            }
-        ])
-        console.log("Suggestion refusée enregistrée")
-        console.log("Pays suggéré : " + paysISO)
-        console.log("Modèle mis à jour pour les prochaines prédictions")
-    } catch (error){
-        console.error("Une erreur est survenue :", error)
-        return null;
-    }
-}
-
-const signalerHistoriqueInsuffisant = (userId, nombreVoyages) =>{
-
-    console.log("Historique insuffisant pour " + userId)
-    console.log("Voyages trouvés  : " + nombreVoyages)
-    console.log("Minimum requis   : " + MINIMUM_VOYAGES)
-    console.log( "Écran de sélection manuelle affiché")
-}
-
-
-// traitement principal
-const predictionPreAtterissage = async (userId, paysOrigine, lireReponseUtilisateur) =>{
-
-    const historiqueVoyages = recupererHistoriqueVoyage(userId, moisHistorique)
-    const nombreVoyages = historiqueVoyages.length
-
-    if (nombreVoyages < minimumVoyage){
-        signalerHistoriqueInsuffisant(userId, nombreVoyages)
-        afficherEcranSelection()
-        return null
-    }
-
-    const moisActuel = extraireMois(new Date())
-    const jourSemaine = extraireJourSemaine(new Date())
-    const destinationUniques = extraireDestinationUniques(historiqueVoyages)
-    const destinationsScorees = []
-    let i = 0
-
-    while (i < destinationUniques.length){
-        const paysISO = destinationUniques[i]
-
-        if (paysISO != paysOrigine){
-            const nbVoyagesPays = compterVoyageParDestination(historiqueVoyages, paysISO)
-
-            const scoreFrequence = calculerScoreFrequence(nbVoyagePays, nombreVoyages)
-
-            const scoreSaison = calculerScoreSaison(historiqueVoyages, paysISO, moisActuel)
-
-            const scoreJourSemaine = calculerScoreJourSemaine(historiqueVoyages, paysISO, jourSemaine)
-
-            const probabilite = calculerProbabiliteFinale(scoreFrequence, scoreSaison, scoreJourSemaine)
-
-            destinationsScorees.push({
-                pays: paysISO,
-                probabilite: probabilite
-            });
-        }
-        i++
-    }
-    const meilleureDestination = trouverMeilleureDestination(destinationScorees)
-
-    if (meilleureDestination === null){
-        afficherEcranSelection()
-        return null
-    }
-
-    if ( meilleureDestination.probabilite >= seuilSuggestion){
-        afficherSuggestion(meilleureDestination.pays, meilleureDestination.probabilite)
-        
-        const suggestionAcceptee = await lireReponseUtilisateur()
-
-        if (suggestionAcceptee === true){
-            return meilleureDestination.pays
-        } else {
-            await enregistrerSuggestionRefusee(userId, meilleureDestination.pays)
-            afficherEcranSelection()
-            return null
-        }
-    } else {
-        afficherEcranSelection()
-        return null
-    }
+module.exports = {
+  SEUIL_SUGGESTION,
+  MINIMUM_VOYAGES,
+  ecartMois,
+  extraireMois,
+  extraireJourSemaine,
+  calculerScoreFrequence,
+  calculerScoreSaison,
+  calculerScoreJourSemaine,
+  calculerProbabiliteFinale,
+  scorerDestinations,
+  recupererHistoriqueVoyage,
+  enregistrerSuggestionRefusee,
+  predictionPreAtterrissage
 }

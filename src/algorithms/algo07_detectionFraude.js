@@ -1,376 +1,271 @@
-const supabase = require ('../supabase')
+'use strict'
 
-const seuilAlerteSilencieuse = 50
-const seuilSuspension = 80
-const multiplicateurMontant = 5.0
-const maxTransactionHeure = 20
-const periodeAnalyse = 90
-const tauxFauxPositifCible = 0.001
-const actionAlerte = "ALERT_ONLY"
-const actionSuspend = "SUSPEND_NUMBER"
-const actionBlock = "BLOCK_ACCOUNT"
+// ════════════════════════════════════════════════════════════
+// ALGO 07 — Détection de fraude (règles déterministes + score statistique)
+//
+// Règles (la première déclenchée l'emporte) :
+//   MONTANT      montant > 5 × moyenne habituelle          → score 85
+//   FREQUENCE    > 20 transactions confirmées dans l'heure   → score 90
+//   LOCALISATION pays de la transaction inhabituel           → score 60
+//   DEVICE       appareil inconnu depuis 90 jours            → score 70
+// Sinon, score statistique (écarts au profil) : 40 × écart montant
+// + 30 × écart fréquence journalière, borné à 100.
+//
+// Décision : ≥ 80 suspension du numéro, ≥ 50 alerte silencieuse.
+// Garde-fous (objectif 0,1 % de faux positifs) :
+//   - profil vierge (démarrage à froid) : les règles comparatives
+//     ne s'appliquent pas tant qu'aucun historique n'existe ;
+//   - le score statistique seul ne déclenche au plus qu'une alerte.
+// Les transactions normales mettent à jour le profil (apprentissage).
+// ════════════════════════════════════════════════════════════
 
-const recupererProfilNormal = async (userId) =>{
-    let resultat 
+const supabase = require('../supabase')
+const logger = require('../utils/logger')
+const {
+  donnees,
+  executerSansEchec,
+  estTableAbsente,
+  estColonneAbsente,
+  insererAvecColonnesOptionnelles,
+  ErreurBase
+} = require('../utils/db')
 
-    try {
-        const {data, error} = await supabase
-        .from('fraud_profile')
-        .select('*')
-        .eq('user_id', userId)
-        .maybeSingle()
+const SEUIL_ALERTE_SILENCIEUSE = 50
+const SEUIL_SUSPENSION = 80
+const MULTIPLICATEUR_MONTANT = 5.0
+const MAX_TRANSACTIONS_HEURE = 20
+const PERIODE_ANALYSE_JOURS = 90
+const TAUX_FAUX_POSITIF_CIBLE = 0.001
+const MINUTES_PAR_JOUR = 24 * 60
+const JOURS_MOYENNE_QUOTIDIENNE = 30
+const LISSAGE_MOYENNE = 0.1 // moyenne mobile exponentielle des montants
+const MAX_PAYS_HABITUELS = 20
 
-        if (error){
-            resultat = null
-        } else {
-            resultat = data
-        }
-    } catch (error){
-        console.error("Une erreur réseau ou système est survenue:", error)
-        return null
-    }
+const ACTION_ALERTE = 'ALERT_ONLY'
+const ACTION_SUSPENSION = 'SUSPEND_NUMBER'
+const ACTION_BLOCAGE = 'BLOCK_ACCOUNT'
 
-    if (resultat != null){
-        return resultat
-    } else {
-        return null
-    }
+const REGLES_DETERMINISTES = ['MONTANT', 'FREQUENCE', 'LOCALISATION', 'DEVICE']
+
+// ── Lectures ────────────────────────────────────────────────
+const recupererProfilNormal = async (userId) => donnees(
+  await supabase.from('fraud_profile').select('*').eq('user_id', userId).maybeSingle(),
+  'lecture du profil de fraude'
+)
+
+const compterTransactionsRecentes = async (userId, nbMinutes, maintenant = new Date()) => {
+  const dateLimite = new Date(maintenant.getTime() - nbMinutes * 60 * 1000).toISOString()
+  const { count, error } = await supabase
+    .from('currency_transaction')
+    .select('*', { count: 'exact', head: true })
+    .eq('user_id', userId)
+    .eq('status', 'CONFIRMED')
+    .gte('created_at', dateLimite)
+  if (error) throw new ErreurBase('comptage des transactions récentes', error)
+  return count || 0
 }
 
-const compterTransactionRecentes = async (userId, nbMinutes) =>{
-    let resultat
-
-    try{
-        const dateLimite = new Date();
-        dateLimite.setMinutes(dateLimite.getMinutes() - nbMinutes);
-
-        const {data, error} = await supabase
-        .from('currency_transaction')
-        .select('*', { count: 'exact', head: true })
-        .eq('user_id', userId)
-        .gte('created_at', new Date().toISOString())
-        .eq('status', "CONFIRMED")
-    } catch (error){
-        console.error("Une erreur est survenue :", error)
-        return null
-    }
-
-    return resultat.count 
+// true = connu, false = inconnu, null = non vérifiable (pas d'identifiant ou table absente).
+const verifierDeviceConnu = async (userId, deviceId, maintenant = new Date()) => {
+  if (!deviceId) return null
+  const dateLimite = new Date(maintenant.getTime() - PERIODE_ANALYSE_JOURS * 24 * 60 * 60 * 1000).toISOString()
+  const { data, error } = await supabase
+    .from('device')
+    .select('*')
+    .eq('user_id', userId)
+    .eq('device_id', deviceId)
+    .gte('last_seen_at', dateLimite)
+    .limit(1)
+  if (error) {
+    if (estTableAbsente(error) || estColonneAbsente(error)) return null
+    throw new ErreurBase('vérification de l\'appareil', error)
+  }
+  return Array.isArray(data) && data.length > 0
 }
 
-const verifierDeviceConnu = async (userId, deviceId) =>{
-    let resultat 
+// typical_countries : tableau de codes ('FR') ou d'objets ({ iso: 'FR' }).
+const paysHabituels = (profil) => (Array.isArray(profil && profil.typical_countries) ? profil.typical_countries : [])
+  .map((pays) => (typeof pays === 'string' ? pays : pays && (pays.iso || pays.pays || pays.country_iso)))
+  .filter(Boolean)
+  .map((pays) => String(pays).toUpperCase())
 
-    try {
-
-        const dateLimite = new Date();
-        dateLimite.setDate(dateLimite.getDate() - PERIODE_ANALYSE);
-
-        const {data, error} = await supabase
-        .from('device')
-        .select('*')
-        .eq('user_id', userId)
-        .eq('device_id', deviceId)
-        .eq('last_seen_at', dateLimite.toISOString())
-        .maybeSingle()
-
-        if (error){
-            resultat = false
-        } else {
-            resultat = true
-        }
-    } catch (error){
-        console.error("Une erreur est survenue :", error)
-        return null
-    }
-
-    if (resultat != null){
-        return true
-    } else {
-        return false
-    }
+// true / false, ou null si non vérifiable (pays inconnu ou profil sans historique).
+const verifierPaysHabituel = (profil, paysActuel) => {
+  const connus = paysHabituels(profil)
+  if (!paysActuel || connus.length === 0) return null
+  return connus.includes(String(paysActuel).toUpperCase())
 }
 
-const verifierPaysHabituel = (profilNormal, paysActuel) =>{
-    
-    let i 
-    let paysConnu
+// ── Règles et score ─────────────────────────────────────────
+const NON_DECLENCHEE = Object.freeze({ declenche: false, typeAnomalie: null, score: 0 })
 
-    const paysTypiques = profilNormal.typical_countries || []
-    paysConnu = false
-    i = 0
-
-    while (i < paysTypiques.length){
-        if (paysTypiques[i].iso === paysActuel){
-            paysConnu = true
-        }
-        i++
-    }
-
-    return paysConnu
+const evaluerRegleDeterministe = (regle, transaction, profil, contexte) => {
+  const moyenne = Number(profil.avg_transaction_amount) || 0
+  switch (regle) {
+    case 'MONTANT':
+      return moyenne > 0 && transaction.montant > moyenne * MULTIPLICATEUR_MONTANT
+        ? { declenche: true, typeAnomalie: 'AMOUNT', score: 85 }
+        : NON_DECLENCHEE
+    case 'FREQUENCE':
+      return contexte.nbTransactionsHeure > MAX_TRANSACTIONS_HEURE
+        ? { declenche: true, typeAnomalie: 'FREQUENCY', score: 90 }
+        : NON_DECLENCHEE
+    case 'LOCALISATION':
+      return verifierPaysHabituel(profil, transaction.pays) === false
+        ? { declenche: true, typeAnomalie: 'LOCATION', score: 60 }
+        : NON_DECLENCHEE
+    case 'DEVICE':
+      return contexte.deviceConnu === false
+        ? { declenche: true, typeAnomalie: 'DEVICE', score: 70 }
+        : NON_DECLENCHEE
+    default:
+      return NON_DECLENCHEE
+  }
 }
 
-const evaluerRegleDeterm = async (regle, transaction, profilNormal) =>{
-    let montantSeuil
-    let nbTransactions
-    const  resultat 
-
-    resultat = {
-        declenche: false,
-        nbTransactions: null,
-        score: 0,
-    }
-
-    if (regle.type === "MONTANT"){
-        const montantSeuil = profilNormal.avg_transaction_amount * multiplicateurMontant
-
-        if (transaction.source_amount > montantSeuil){
-            resultat.declenche = true
-            resultat.typeAnomalie = "AMOUNT"
-            resultat.score = 85
-        }
-    }
-
-    if (regle.type === "FREQUENCE"){
-        const nbTransactions = await compterTransactionRecentes(transaction.user_id, 60)
-
-        if (nbTransactions > maxTransactionHeure){
-            resultat.declenche = true
-            resultat.typeAnomalie = "FREQUENCY"
-            resultat.score = 90
-        }
-    }
-
-    if (regle.type === "LOCALISATION"){
-        if (verifierPaysHabituel(profilNormal, transaction.target_currency) === false){
-            resultat.declenche = true
-            resultat.typeAnomalie = "FREQUENCY"
-            resultat.score = 60
-        }
-    }
-
-    if (regle.type === "DEVICE"){
-        if (verifierDeviceConnu(transaction.user_id, transaction.device_id) === false){
-            resultat.declenche = true
-            resultat.typeAnomalie = "FREQUENCY"
-            resultat.score = 70
-        }
-    }
-
-    return resultat;
+const calculerScoreML = (transaction, profil, nbTransactions24h) => {
+  const moyenneMontant = Number(profil.avg_transaction_amount) || 0
+  const moyenneQuotidienne = Number(profil.avg_daily_transactions) || 0
+  const ecartMontant = moyenneMontant > 0 ? Math.abs(transaction.montant - moyenneMontant) / moyenneMontant : 0
+  const ecartFrequence = moyenneQuotidienne > 0 ? Math.abs(nbTransactions24h - moyenneQuotidienne) / moyenneQuotidienne : 0
+  return Math.min(100, Math.round(ecartMontant * 40 + ecartFrequence * 30))
 }
 
-const calculerScoreML = async (transaction, profilMiroir) =>{
-    let deviationMontant
-    let deviationFrequence
-    let scoreTotal
-
-    if (profilNormal.avg_transaction_amount > 0){
-        deviationMontant = Math.abs(transaction.source_amount - profilNormal.avg_transaction_amount)/profilNormal.avg_transaction_amount
-    } else {
-        deviationMontant = 0
-    }
-
-    if (profilNormal.avg_daily_transactions > 0){
-        deviationFrequence = Math.abs(compterTransactionRecentes(transaction.user_id, 1400) - profilNormal.avg_daily_transactions)/profilNormal.avg_daily_transactions
-    } else {
-        deviationFrequence = 0
-    }
-
-    scoreTotal = (deviationMontant * 40) + (deviationFrequence * 30)
-    if (score > 100){
-        score = 100
-    }
-    return scoreTotal
+const determinerAction = (scoreAnomalie) => {
+  if (scoreAnomalie >= SEUIL_SUSPENSION) return ACTION_SUSPENSION
+  if (scoreAnomalie >= SEUIL_ALERTE_SILENCIEUSE) return ACTION_ALERTE
+  return null
 }
 
-const determinerAction = (scoreAnomalie) =>{
-    let action
-
-    if (scoreAnomalie >= seuilSuspension){
-        action = actionSuspend
-    }
-
-    if (scoreAnomalie >= seuilAlerteSilencieuse && scoreAnomalie < seuilSuspension){
-        action = actionAlerte
-    }
-
-    if (scoreAnomalie < seuilAlerteSilencieuse){
-        action = null
-    }
-
-    return action
+// ── Procédures ──────────────────────────────────────────────
+const creerAlerteAnomalie = async (userId, profil, scoreAnomalie, typeAnomalie, transaction, action) => {
+  const { error } = await insererAvecColonnesOptionnelles(supabase, 'fraud_alert', {
+    user_id: userId,
+    profile_id: profil.profile_id,
+    alert_type: typeAnomalie,
+    anomaly_score: scoreAnomalie,
+    triggered_by: {
+      transaction_id: transaction.transaction_id || null,
+      montant: transaction.montant,
+      devise: transaction.devise || null,
+      pays: transaction.pays || null
+    },
+    action_taken: action
+  }, ['profile_id', 'triggered_by'])
+  if (error) logger.warn('Enregistrement de l\'alerte de fraude impossible', { code: error.code })
+  logger.warn('Alerte de fraude', { userId, scoreAnomalie, typeAnomalie, action })
 }
 
-// Procédures
-const creerAlerteAnomalie = async (userId, scoreAnomalie, typeAnomalie, transaction, action, profileId) =>{
-
-    try {
-        const {data, error} = await supabase
-        .from('fraud_alert')
-        .insert([
-            {
-                user_id: userId,
-                profile_id: profilNormal.profile_id,
-                alert_type: typeAnomalie,
-                anomaly_score: scoreAnomalie,
-                triggerd_by: {
-                    transaction_id : transaction.transaction_id,
-                    montant        : transaction.source_amount,
-                    devise         : transaction.source_currency,
-                    pays           : transaction.target_currency
-                },
-                action_taken: action,
-                created_at: new Date().toISOString(),
-            }
-        ])
-        console.log("Alerte créée — Score : " + scoreAnomalie)
-        console.log("Type     : " + typeAnomalie)
-        console.log("Action   : " + action)
-    } catch (error){
-        console.error("Une erreur est survenue:", error)
-        return null
-    }
+const suspendreNumeroVirtuel = async (userId) => {
+  donnees(
+    await supabase
+      .from('virtual_number')
+      .update({ status: 'SUSPENDED', suspended_at: new Date().toISOString() })
+      .eq('user_id', userId)
+      .eq('status', 'ACTIVE'),
+    'suspension du numéro virtuel'
+  )
+  logger.warn('Numéros virtuels suspendus (activité frauduleuse suspectée)', { userId })
 }
 
-const suspendreNumeroVirtuel = async (userId) =>{
-
-    try{
-        const{data, error} = await supabase
-        .from('virtual_number')
-        .update ({
-            status : suspended,
-            suspended_at: new Date().toISOString()
-        })
-        .eq('user_id', userId)
-        .eq('status', "ACTIVE")
-
-        console.log("Numéro virtuel suspendu pour " + userId)
-        console.log("Raison : Activité frauduleuse détectée")
-    } catch (error){
-        console.error("Une erreur est survenue:", error)
-        return null
-    }
+// Pas de canal de notification branché : trace pour le support.
+const notifierUtilisateur = (userId, typeAnomalie) => {
+  logger.info('Notification sécurité à envoyer à l\'utilisateur', { userId, typeAnomalie })
 }
 
-const notifierUserId = (userId, typeAnomalie) =>{
+const mettreAJourProfilML = (userId, profil, scoreAnomalie) => executerSansEchec(
+  supabase.from('fraud_profile').update({
+    anomaly_score: scoreAnomalie,
+    last_alert_at: new Date().toISOString(),
+    total_alerts: (Number(profil.total_alerts) || 0) + 1
+  }).eq('user_id', userId),
+  'mise à jour du profil de fraude'
+)
 
-    console.log("══════════════════════════════════════")
-    console.log("NOTIFICATION SÉCURITÉ")
-    console.log("══════════════════════════════════════")
-    console.log("Activité anormale détectée sur votre compte")
-    console.log("Type : " + typeAnomalie)
-    console.log("Votre numéro virtuel a été suspendu")
-    console.log("par précaution.")
-    console.log("Contactez le support Orange si nécessaire.")
-    console.log("══════════════════════════════════════")
+const journaliserTransactionNormale = (userId, scoreAnomalie) => executerSansEchec(
+  supabase.from('fraud_profile').update({ anomaly_score: scoreAnomalie }).eq('user_id', userId),
+  'score du profil de fraude'
+)
+
+// Apprentissage après une transaction confirmée et jugée normale.
+const apprendreTransaction = async (userId, transaction, { maintenant = new Date() } = {}) => {
+  const profil = await recupererProfilNormal(userId)
+  if (!profil) return false
+
+  const moyenne = Number(profil.avg_transaction_amount) || 0
+  const nouvelleMoyenne = moyenne > 0
+    ? (1 - LISSAGE_MOYENNE) * moyenne + LISSAGE_MOYENNE * transaction.montant
+    : transaction.montant
+
+  const nb30Jours = await compterTransactionsRecentes(userId, JOURS_MOYENNE_QUOTIDIENNE * MINUTES_PAR_JOUR, maintenant)
+  const pays = paysHabituels(profil)
+  if (transaction.pays && !pays.includes(String(transaction.pays).toUpperCase())) pays.push(String(transaction.pays).toUpperCase())
+
+  return executerSansEchec(
+    supabase.from('fraud_profile').update({
+      avg_transaction_amount: Number(nouvelleMoyenne.toFixed(2)),
+      avg_daily_transactions: Number((nb30Jours / JOURS_MOYENNE_QUOTIDIENNE).toFixed(3)),
+      typical_countries: pays.slice(-MAX_PAYS_HABITUELS)
+    }).eq('user_id', userId),
+    'apprentissage du profil de fraude'
+  )
 }
 
-const mettreAJourProfilML = async(userId, scoreAnomalie, totalAlertesActuel) =>{
+// ── Traitement principal ────────────────────────────────────
+// transaction : { montant, devise?, pays?, device_id?, transaction_id? }
+const detectionFraudeIA = async (userId, transaction, { maintenant = new Date() } = {}) => {
+  const profil = await recupererProfilNormal(userId)
+  if (!profil) {
+    logger.info('Profil de fraude inexistant : transaction autorisée par défaut', { userId })
+    return { statut: 'NORMAL', scoreAnomalie: 0, raison: 'PROFIL_ABSENT' }
+  }
 
-    try{
-        const{data, error} = await supabase
-        .from('fraud_profile')
-        .update({
-            anomaly_score: scoreAnomalie,
-            last_alert_at: new Date().toISOString(),
-            total_alerts: totalAlertesActuel + 1,
-            updated_at: new Date().toISOString()
-        })
-        .eq('user_id', userId)
-    } catch (error){
-        console.error("Une erreur est survenue lors de la mise à jour:", error)
-        return null;
+  const [nbTransactionsHeure, nbTransactions24h, deviceConnu] = await Promise.all([
+    compterTransactionsRecentes(userId, 60, maintenant),
+    compterTransactionsRecentes(userId, MINUTES_PAR_JOUR, maintenant),
+    verifierDeviceConnu(userId, transaction.device_id, maintenant)
+  ])
+  const contexte = { nbTransactionsHeure, deviceConnu }
+
+  let regleDeclenchee = null
+  for (const regle of REGLES_DETERMINISTES) {
+    const resultat = evaluerRegleDeterministe(regle, transaction, profil, contexte)
+    if (resultat.declenche) {
+      regleDeclenchee = resultat
+      break
     }
+  }
 
-    console.log("Profil ML mis à jour pour " + userId)
+  const scoreAnomalie = regleDeclenchee ? regleDeclenchee.score : calculerScoreML(transaction, profil, nbTransactions24h)
+  const typeAnomalie = regleDeclenchee ? regleDeclenchee.typeAnomalie : 'ML_DETECTION'
+  let action = determinerAction(scoreAnomalie)
+  if (!regleDeclenchee && action === ACTION_SUSPENSION) action = ACTION_ALERTE
+
+  if (!action) {
+    await journaliserTransactionNormale(userId, scoreAnomalie)
+    return { statut: 'NORMAL', scoreAnomalie }
+  }
+
+  await creerAlerteAnomalie(userId, profil, scoreAnomalie, typeAnomalie, transaction, action)
+  await mettreAJourProfilML(userId, profil, scoreAnomalie)
+
+  if (action === ACTION_ALERTE) return { statut: 'ALERTE', scoreAnomalie, typeAnomalie }
+
+  await suspendreNumeroVirtuel(userId)
+  notifierUtilisateur(userId, typeAnomalie)
+  return { statut: 'SUSPENDU', scoreAnomalie, typeAnomalie }
 }
 
-const journaliserTransactionNormale = async (userId, scoreAnomalie) =>{
-
-    try{
-        const {data, error} = await supabase
-        .from('fraud_profile')
-        .update({
-            anomaly_score: scoreAnomalie,
-            updated_at: new Date().toISOString()
-        })
-        .eq('user_id', userId)
-    } catch (error){
-        console.log("Une erreur réseau ou système est survenue :", error)
-        return null
-    }
-    console.log( "Transaction normale — Score : " + scoreAnomalie + "/100")
-}
-
-
-// traitement principal
-const detctionFraudeIA = () =>{
-    
-    const profilNormal = await recupererProfilNormal(userId)
-    if (profilNormal === null){
-        console.log("Profil ML inexistant pour " + userId)
-        console.log("Transaction autorisée par défaut")
-        return null
-    }
-
-    const eglesDeterm = [
-        { type: "MONTANT"     },
-        { type: "FREQUENCE"   },
-        { type: "LOCALISATION"},
-        { type: "DEVICE"      }
-    ]
-
-    let regleDeclenchee = FALSE
-    let scoreAnomalie   = 0
-    let typeAnomalie    = NULL
-    let i               = 0
-
-    while (i < reglesDeterm.length && regleDeclenchee === false){
-        const regle = reglesDeterm[i]
-        const resultat = await calculerReglesDeterm(regle, transaction, profilNormal)
-
-        if (resultat.declenche === true){
-            regleDeclenchee = TRUE
-            scoreAnomalie   = resultat.score
-            typeAnomalie    = resultat.typeAnomalie
-        }
-        i++
-    }
-
-    if (regleDeclenchee === false){
-        scoreAnomalie = calculerScoreML(transaction, profilNormal)
-        typeAnomalie = "ML_DETECTION"
-    }
-
-    const actionDecidee = determinerAction(scoreAnomalie)
-    if (actionDecidee === null){
-        await journaliserTransactionNormale(userId, scoreAnomalie)
-        return {
-            statut        : "NORMAL",
-            scoreAnomalie : scoreAnomalie
-        }
-    }
-
-    if (actionDecidee === actionAlerte){
-        await creerAlerteAnomalie(userId, scoreAnomalie, typeAnomalie, transaction, actionAlerte)
-        await mettreAJourProfilML (userId, scoreAnomalie)
-        return {
-            statut        : "ALERTE",
-            scoreAnomalie : scoreAnomalie,
-            typeAnomalie  : typeAnomalie
-        }
-    }
-
-    if (actionDecidee = actionSuspend){
-        await creerAlerteAnomalie(userId, scoreAnomalie, typeAnomlie, transaction, actionSuspend)
-        await suspendreNumeroVirtuel(userId)
-        notifierUtilisateur(userId, typeAnomalie)
-        await mettreAJourProfilML(userId, scoreAnomalie)
-        return {
-            statut        : "SUSPENDU",
-            scoreAnomalie : scoreAnomalie,
-            typeAnomalie  : typeAnomalie
-        }
-    }
+module.exports = {
+  ACTION_ALERTE,
+  ACTION_SUSPENSION,
+  ACTION_BLOCAGE,
+  TAUX_FAUX_POSITIF_CIBLE,
+  paysHabituels,
+  verifierPaysHabituel,
+  evaluerRegleDeterministe,
+  calculerScoreML,
+  determinerAction,
+  apprendreTransaction,
+  detectionFraudeIA
 }

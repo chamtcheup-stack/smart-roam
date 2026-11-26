@@ -1,254 +1,196 @@
+'use strict'
+
 const supabase = require('../supabase')
-const crypto   = require('crypto')
+const v = require('../utils/validation')
+const { requeteInvalide, introuvable, conflit } = require('../utils/http')
+const { donnees, estViolationUnicite, executerSansEchec, paginer, ErreurBase } = require('../utils/db')
+const { auditerRequete } = require('../utils/audit')
+const { genererTokens, determinerRole, revoquerTousTokens } = require('../algorithms/algo10_zeroTrustJWT')
+const { resoudreRegionCloud } = require('../algorithms/algo14_cloisonnementSouverainete')
+
+const STATUTS_KYC = ['PENDING', 'VERIFIED', 'REJECTED']
+
+// Liste blanche des champs exposés (jamais pin_hash, pin_salt, mfa_secret…).
+const CHAMPS_PROFIL = [
+  'user_id', 'phone_number', 'country_of_residence', 'kyc_status', 'kyc_verified_at',
+  'plan_id', 'data_region', 'residence_status', 'global_identity_status', 'user_origin_type',
+  'display_name', 'avatar_url', 'home_orange_affiliate', 'created_at'
+]
+
+const profilPublic = (utilisateur) =>
+  Object.fromEntries(CHAMPS_PROFIL.filter((champ) => champ in utilisateur).map((champ) => [champ, utilisateur[champ]]))
+
+const chargerUtilisateurActif = async (userId) => {
+  const utilisateur = donnees(
+    await supabase.from('users').select('*').eq('user_id', userId).maybeSingle(),
+    'lecture de l\'utilisateur'
+  )
+  return utilisateur && !utilisateur.deleted_at ? utilisateur : null
+}
 
 // ════════════════════════════════════════════
 // POST /api/users/register
-// Créer un nouvel utilisateur
+// Créer un nouvel utilisateur (public, limité en débit)
 // ════════════════════════════════════════════
 const inscrireUtilisateur = async (req, res) => {
-  try {
-    const { phoneNumber, countryResidence, planId } = req.body
+  v.exigerChamps(req.body, ['phoneNumber', 'countryResidence'])
+  const telephone = v.telephone(req.body.phoneNumber, 'phoneNumber')
+  const paysResidence = v.paysISO(req.body.countryResidence, 'countryResidence')
+  const planId = v.identifiant(req.body.planId, 'planId', { optionnel: true }) || null
 
-    if (!phoneNumber || !countryResidence) {
-      return res.status(400).json({
-        erreur : 'Champs manquants',
-        requis : ['phoneNumber', 'countryResidence']
-      })
-    }
+  // Le numéro peut être stocké avec ou sans « + » : les deux variantes sont vérifiées.
+  const existants = donnees(
+    await supabase.from('users').select('user_id').in('phone_number', v.variantesTelephone(telephone)).limit(1),
+    'vérification du numéro de téléphone'
+  )
+  if (existants && existants.length > 0) throw conflit('Ce numéro de téléphone est déjà enregistré')
 
-    // Vérifier que le numéro n'existe pas déjà
-    const { data: existant } = await supabase
-      .from('users')
-      .select('user_id')
-      .eq('phone_number', phoneNumber)
-      .single()
+  const pays = donnees(
+    await supabase.from('country').select('*').eq('country_iso', paysResidence).maybeSingle(),
+    'lecture du pays de résidence'
+  )
+  if (!pays) throw requeteInvalide(`Pays introuvable : ${paysResidence}`, { champ: 'countryResidence' })
 
-    if (existant) {
-      return res.status(409).json({
-        erreur : 'Ce numéro de téléphone est déjà enregistré'
-      })
-    }
+  const { data: user, error } = await supabase
+    .from('users')
+    .insert([{
+      phone_number: telephone,
+      country_of_residence: paysResidence,
+      kyc_status: 'PENDING',
+      plan_id: planId,
+      data_region: pays.data_region || resoudreRegionCloud(paysResidence).region,
+      residence_status: 'RESIDENT',
+      global_identity_status: 'PENDING_SYNC',
+      user_origin_type: 'ORANGE_NATIVE'
+    }])
+    .select()
+    .single()
 
-    // Vérifier que le pays existe
-    const { data: pays } = await supabase
-      .from('country')
-      .select('*')
-      .eq('country_iso', countryResidence)
-      .single()
-
-    if (!pays) {
-      return res.status(400).json({
-        erreur : 'Pays introuvable : ' + countryResidence
-      })
-    }
-
-    // Créer l'utilisateur
-    const { data: user, error } = await supabase
-      .from('users')
-      .insert([{
-        phone_number           : phoneNumber,
-        country_of_residence   : countryResidence,
-        kyc_status             : 'PENDING',
-        plan_id                : planId || null,
-        data_region            : pays.data_region,
-        residence_status       : 'RESIDENT',
-        global_identity_status : 'PENDING_SYNC',
-        user_origin_type       : 'ORANGE_NATIVE'
-      }])
-      .select()
-      .single()
-
-    if (error) {
-      return res.status(500).json({
-        erreur : 'Erreur création utilisateur',
-        detail : error.message
-      })
-    }
-
-    // Créer le profil de fraude
-    await supabase
-      .from('fraud_profile')
-      .insert([{
-        user_id                 : user.user_id,
-        avg_transaction_amount  : 0,
-        avg_daily_transactions  : 0,
-        typical_countries       : [],
-        typical_hours           : [],
-        anomaly_score           : 0,
-        total_alerts            : 0,
-        model_version           : '1.0'
-      }])
-
-    return res.status(201).json({
-      message : 'Utilisateur créé avec succès',
-      user    : {
-        user_id              : user.user_id,
-        phone_number         : user.phone_number,
-        country_of_residence : user.country_of_residence,
-        kyc_status           : user.kyc_status
-      }
-    })
-
-  } catch (error) {
-    console.error('Erreur inscrireUtilisateur :', error)
-    return res.status(500).json({
-      erreur : 'Erreur serveur',
-      detail : error.message
-    })
+  if (error) {
+    // Deux inscriptions simultanées du même numéro : la contrainte d'unicité tranche.
+    if (estViolationUnicite(error)) throw conflit('Ce numéro de téléphone est déjà enregistré')
+    throw new ErreurBase('création de l\'utilisateur', error)
   }
+
+  // Profil de fraude initial (algo 07) : son absence désactiverait la détection.
+  await executerSansEchec(
+    supabase.from('fraud_profile').insert([{
+      user_id: user.user_id,
+      avg_transaction_amount: 0,
+      avg_daily_transactions: 0,
+      typical_countries: [],
+      typical_hours: [],
+      anomaly_score: 0,
+      total_alerts: 0,
+      model_version: '1.0'
+    }]),
+    'création du profil de fraude'
+  )
+
+  // Jetons de session : permettent au titulaire de définir son premier PIN.
+  const tokens = await genererTokens({ userId: user.user_id, role: determinerRole(user) })
+
+  return res.status(201).json({
+    message: 'Utilisateur créé avec succès',
+    user: {
+      user_id: user.user_id,
+      phone_number: user.phone_number,
+      country_of_residence: user.country_of_residence,
+      kyc_status: user.kyc_status
+    },
+    tokens
+  })
 }
 
 // ════════════════════════════════════════════
 // GET /api/users/:userId
-// Récupérer le profil d'un utilisateur
 // ════════════════════════════════════════════
 const getUtilisateur = async (req, res) => {
-  try {
-    const { userId } = req.params
+  const utilisateur = await chargerUtilisateurActif(req.params.userId)
+  if (!utilisateur) throw introuvable('Utilisateur introuvable')
 
-    const { data, error } = await supabase
-      .from('users')
-      .select('*')
-      .eq('user_id', userId)
-      .single()
-
-    if (error || !data) {
-      return res.status(404).json({
-        erreur : 'Utilisateur introuvable'
-      })
-    }
-
-    // Ne pas retourner les données sensibles
-    const { pin_hash, pin_salt, mfa_secret, ...userSafe } = data
-
-    return res.status(200).json({
-      message : 'Utilisateur trouvé',
-      user    : userSafe
-    })
-
-  } catch (error) {
-    return res.status(500).json({
-      erreur : 'Erreur serveur',
-      detail : error.message
-    })
-  }
+  return res.status(200).json({
+    message: 'Utilisateur trouvé',
+    user: profilPublic(utilisateur)
+  })
 }
 
 // ════════════════════════════════════════════
-// PUT /api/users/:userId/kyc
-// Mettre à jour le statut KYC
+// PUT /api/users/:userId/kyc   (ADMIN / SERVICE)
 // ════════════════════════════════════════════
 const mettreAJourKYC = async (req, res) => {
-  try {
-    const { userId }    = req.params
-    const { kycStatus } = req.body
+  const { userId } = req.params
+  const kycStatus = v.enumeration(req.body.kycStatus, 'kycStatus', { valeurs: STATUTS_KYC, message: 'Statut KYC invalide' })
 
-    const statutsValides = ['PENDING', 'VERIFIED', 'REJECTED']
-    if (!kycStatus || !statutsValides.includes(kycStatus)) {
-      return res.status(400).json({
-        erreur  : 'Statut KYC invalide',
-        valides : statutsValides
-      })
-    }
+  if (!(await chargerUtilisateurActif(userId))) throw introuvable('Utilisateur introuvable')
 
-    const { data, error } = await supabase
+  const utilisateur = donnees(
+    await supabase
       .from('users')
       .update({
-        kyc_status      : kycStatus,
-        kyc_verified_at : kycStatus === 'VERIFIED'
-                          ? new Date()
-                          : null
+        kyc_status: kycStatus,
+        kyc_verified_at: kycStatus === 'VERIFIED' ? new Date().toISOString() : null
       })
       .eq('user_id', userId)
       .select()
-      .single()
+      .single(),
+    'mise à jour du statut KYC'
+  )
+  void auditerRequete(req, { userId, entite: 'USER', action: `KYC_${kycStatus}` })
 
-    if (error) {
-      return res.status(500).json({
-        erreur : 'Erreur mise à jour KYC',
-        detail : error.message
-      })
-    }
-
-    return res.status(200).json({
-      message    : 'Statut KYC mis à jour',
-      user_id    : userId,
-      kyc_status : data.kyc_status
-    })
-
-  } catch (error) {
-    return res.status(500).json({
-      erreur : 'Erreur serveur',
-      detail : error.message
-    })
-  }
+  return res.status(200).json({
+    message: 'Statut KYC mis à jour',
+    user_id: userId,
+    kyc_status: utilisateur.kyc_status
+  })
 }
 
 // ════════════════════════════════════════════
 // GET /api/users/:userId/numbers
-// Récupérer tous les numéros virtuels d'un user
 // ════════════════════════════════════════════
 const getMesNumeros = async (req, res) => {
-  try {
-    const { userId } = req.params
-
-    const { data, error } = await supabase
+  const page = v.pagination(req.query)
+  const { lignes, total } = await paginer(
+    supabase
       .from('virtual_number')
-      .select('*')
-      .eq('user_id', userId)
-      .order('created_at', { ascending: false })
+      .select('*', { count: 'exact' })
+      .eq('user_id', req.params.userId)
+      .order('created_at', { ascending: false }),
+    page,
+    'lecture des numéros virtuels'
+  )
 
-    if (error) {
-      return res.status(500).json({
-        erreur : 'Erreur lecture numéros',
-        detail : error.message
-      })
-    }
-
-    return res.status(200).json({
-      message  : 'Numéros virtuels récupérés',
-      numeros  : data,
-      total    : data.length
-    })
-
-  } catch (error) {
-    return res.status(500).json({
-      erreur : 'Erreur serveur',
-      detail : error.message
-    })
-  }
+  return res.status(200).json({
+    message: 'Numéros virtuels récupérés',
+    numeros: lignes,
+    total,
+    ...page
+  })
 }
 
 // ════════════════════════════════════════════
-// DELETE /api/users/:userId
-// Supprimer un utilisateur (soft delete)
+// DELETE /api/users/:userId  (suppression logique)
 // ════════════════════════════════════════════
 const supprimerUtilisateur = async (req, res) => {
-  try {
-    const { userId } = req.params
+  const { userId } = req.params
+  if (!(await chargerUtilisateurActif(userId))) throw introuvable('Utilisateur introuvable')
 
-    const { error } = await supabase
-      .from('users')
-      .update({ deleted_at: new Date() })
-      .eq('user_id', userId)
+  donnees(
+    await supabase.from('users').update({ deleted_at: new Date().toISOString() }).eq('user_id', userId),
+    'suppression de l\'utilisateur'
+  )
 
-    if (error) {
-      return res.status(500).json({
-        erreur : 'Erreur suppression',
-        detail : error.message
-      })
-    }
+  // Plus aucun appel routé vers un compte supprimé.
+  await executerSansEchec(
+    supabase.from('virtual_number').update({ status: 'PARKED' }).eq('user_id', userId).in('status', ['ACTIVE', 'AWAITING_ARRIVAL']),
+    'mise en parking des numéros du compte supprimé'
+  )
 
-    return res.status(200).json({
-      message : 'Utilisateur supprimé avec succès'
-    })
+  // Toutes les sessions du compte sont révoquées immédiatement.
+  await revoquerTousTokens(userId)
+  void auditerRequete(req, { userId, entite: 'USER', action: 'COMPTE_SUPPRIME' })
 
-  } catch (error) {
-    return res.status(500).json({
-      erreur : 'Erreur serveur',
-      detail : error.message
-    })
-  }
+  return res.status(200).json({ message: 'Utilisateur supprimé avec succès' })
 }
 
 module.exports = {
@@ -256,5 +198,6 @@ module.exports = {
   getUtilisateur,
   mettreAJourKYC,
   getMesNumeros,
-  supprimerUtilisateur
+  supprimerUtilisateur,
+  profilPublic
 }

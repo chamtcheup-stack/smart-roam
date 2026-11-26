@@ -1,304 +1,167 @@
-const supabase = require ('../supabase')
+'use strict'
 
-const typeProfil = "PROFILE"
-const typeAvatar = "AVATAR"
-const badgeVerifie = "KYC_VERIFIE"
-const badgeAucun = "AUCUN"
-const dateExpiration = 30
+// ════════════════════════════════════════════════════════════
+// ALGO 18 — Synchronisation du profil miroir d'un numéro virtuel
+//
+// Le profil affiché aux correspondants du pays de destination
+// (nom, avatar, badge KYC, filiale d'origine) respecte le consentement :
+//   - nom    : consentement PROFILE ; à défaut d'enregistrement, base
+//              contractuelle (affichage nécessaire au service, 30 jours) ;
+//              un refus explicite de l'utilisateur est toujours respecté ;
+//   - avatar : consentement AVATAR explicite, jamais dans les pays qui
+//              interdisent le partage de photos.
+// Le numéro de téléphone réel n'est JAMAIS utilisé comme nom affiché.
+// ════════════════════════════════════════════════════════════
 
-const recupererProfilOrigine = async (userId) =>{
-    let resultat
+const supabase = require('../supabase')
+const logger = require('../utils/logger')
+const { donnees } = require('../utils/db')
 
-    try{
-        const {data, error} = await supabase
-        .from('users')
-        .select('phone_number, kyc_status, home_orange_affiliate, country_of_residence, display_name, avatar_url')
-        .eq('user_id', userId)
-        .maybeSingle();
+const TYPE_PROFIL = 'PROFILE'
+const TYPE_AVATAR = 'AVATAR'
+const BADGE_VERIFIE = 'KYC_VERIFIE'
+const BADGE_AUCUN = 'AUCUN'
+const NOM_PAR_DEFAUT = 'Utilisateur Orange'
+const DUREE_CONSENTEMENT_JOURS = 30
+const PAYS_INTERDITS_PHOTO = Object.freeze(['SA', 'IR', 'KP'])
 
-        if (error){
-            resultat = null
-        } else {
-            resultat = data
-        }
-        console.log(resultat)
-    } catch (error){
-        console.error("Une erreur est survenue:", error)
-    }
+const CONSENTEMENT_ACCORDE = 'ACCORDE'
+const CONSENTEMENT_REFUSE = 'REFUSE'
+const CONSENTEMENT_EXPIRE = 'EXPIRE'
+const CONSENTEMENT_ABSENT = 'ABSENT'
 
-    if (resultat != null){
-        return resultat
-    } else {
-        return null;
-    }
+const ajouterJours = (date, jours) => new Date(date.getTime() + jours * 24 * 60 * 60 * 1000)
+
+// ── Lectures ────────────────────────────────────────────────
+const recupererProfilOrigine = async (userId) => {
+  const profil = donnees(
+    await supabase.from('users').select('*').eq('user_id', userId).maybeSingle(),
+    'lecture du profil d\'origine'
+  )
+  return profil && !profil.deleted_at ? profil : null
 }
 
+const recupererNumero = async (numberId) => donnees(
+  await supabase.from('virtual_number').select('*').eq('number_id', numberId).maybeSingle(),
+  'lecture du numéro virtuel'
+)
 
-const verifierConsentementNom = async (userId, paysDestination) =>{
-    let resultat
-
-    try {
-        const {data, error} = await supabase
-        .from('data_sovereignty_consent')
-        .select('*')
-        .eq('user_id', userId)
-        .eq('destination_country', paysDestination)
-        .eq('data_type', typeProfil)
-        .eq('is_granted', true)
-        .gt('expires_at' > new Date().toISOString())
-        .maybeSingle();
-
-        if (error){
-            resultat = false
-        } else {
-            resultat = true
-        }
-
-    } catch (error){
-        console.error("Une erreur est survenue lors de la vérification du nom:", error)
-        return null;
-    }
-
-    if (resultat != null){
-        return true
-    } else {
-        return false
-    }
+// État du dernier consentement enregistré pour (utilisateur, pays, type).
+const lireConsentement = async (userId, paysDestination, typeDonnee, maintenant = new Date()) => {
+  const lignes = donnees(
+    await supabase
+      .from('data_sovereignty_consent')
+      .select('*')
+      .eq('user_id', userId)
+      .eq('destination_country', paysDestination)
+      .eq('data_type', typeDonnee)
+      .order('granted_at', { ascending: false })
+      .limit(1),
+    'lecture du consentement'
+  )
+  const consentement = lignes && lignes[0]
+  if (!consentement) return CONSENTEMENT_ABSENT
+  if (!consentement.is_granted) return CONSENTEMENT_REFUSE
+  if (consentement.expires_at && Date.parse(consentement.expires_at) <= maintenant.getTime()) return CONSENTEMENT_EXPIRE
+  return CONSENTEMENT_ACCORDE
 }
 
-const verifierConsentementAvatar = async(userId, paysDestination) =>{
-    let resultat
+const verifierPaysInterditPhoto = (paysDestination) => PAYS_INTERDITS_PHOTO.includes(paysDestination)
 
-    try{
-        const {data, error} = await supabase
-        .from('data_sovereignty_consent')
-        .select('*')
-        .eq('user_id', userId)
-        .eq('destination_country', paysDestination)
-        .eq('data_type', typeAvatar)
-        .eq('is_granted', true)
-        .gt('expires_at' > new Date().toISOString)
-        .maybeSingle()
+const determinerBadgeKYC = (profilOrigine) => (profilOrigine.kyc_status === 'VERIFIED' ? BADGE_VERIFIE : BADGE_AUCUN)
 
-        if (error){
-            resultat = false
-        } else {
-            resultat = true
-        }
-    }  catch (error){
-        console.error("Une erreur est survenue lors de la vérification de l'avatar:", error)
-        return null;
-    }
-
-    if (resultat != null){
-        return true
-    } else {
-        return false
-    }
+// Nom affichable : jamais le numéro de téléphone.
+const nomAffichable = (profil) => {
+  const nom = profil.display_name || profil.full_name || [profil.first_name, profil.last_name].filter(Boolean).join(' ')
+  return typeof nom === 'string' && nom.trim() ? nom.trim().slice(0, 100) : null
 }
 
-const verifierPaysInterditPhoto = (paysDestination) =>{
-    
-    let interdit
-    let i 
+const construireProfilMiroir = (profilOrigine, nomAutorise, avatarAutorise, badge) => ({
+  display_name: (nomAutorise && nomAffichable(profilOrigine)) || NOM_PAR_DEFAUT,
+  avatar_url: avatarAutorise ? (profilOrigine.avatar_url || null) : null,
+  kyc_badge: badge,
+  home_affiliate: profilOrigine.home_orange_affiliate || null
+})
 
-    const paysInterditsPhoto = [
-        "SA", "IR", "KP"
-    ]
-    interdit = false
-    i = 0
-
-    while (i < paysInterditsPhoto.length){
-        if (paysInterditsPhoto[i] === paysDestination){
-            interdit = true
-        }
-        i++
-    }
-    return interdit
+// ── Procédures ──────────────────────────────────────────────
+const enregistrerConsentementDefaut = async (userId, paysDestination, maintenant = new Date()) => {
+  donnees(
+    await supabase.from('data_sovereignty_consent').insert([{
+      user_id: userId,
+      destination_country: paysDestination,
+      data_type: TYPE_PROFIL,
+      is_granted: true,
+      granted_at: maintenant.toISOString(),
+      expires_at: ajouterJours(maintenant, DUREE_CONSENTEMENT_JOURS).toISOString(),
+      legal_basis: 'CONTRACTUAL'
+    }]),
+    'enregistrement du consentement par défaut'
+  )
+  logger.info('Base contractuelle enregistrée pour l\'affichage du nom', { userId, paysDestination, jours: DUREE_CONSENTEMENT_JOURS })
 }
 
-const determinerBadgeKYC = (profilOrigine) =>{
-    let badge
-
-    if (profilOrigine.kyc.status === "VERIFIED"){
-        badge = badgeVerifie
-    } else {
-        badge = badgeAucun
-    }
-
-    return badge
-}
-
-const construireProfilMiroir = (ProfilOrigine, nomAutorise, avatarAutorise, badge) =>{
-    let resultat
-
-    let profil = ({
-        display_name = null,
-        avatar_url = null,
-        kyc_badge = badge,
-        home_affiliate = profilOrigine.home_orange_affiliate,
+const enregistrerProfilMiroir = async (numberId, profilMiroir) => donnees(
+  await supabase
+    .from('virtual_number')
+    .update({
+      mirror_display_name: profilMiroir.display_name,
+      mirror_avatar_url: profilMiroir.avatar_url,
+      mirror_synced_at: new Date().toISOString()
     })
+    .eq('number_id', numberId)
+    .select()
+    .single(),
+  'enregistrement du profil miroir'
+)
 
-    if (nomAutorise = true){
-        profil.display_name = profilOrigine.display_name
-    } else {
-        profil.display_name = "Utilisateur Orange"
-    }
+// ── Traitement principal ────────────────────────────────────
+const synchroniserProfilMiroir = async (userId, numberId, { maintenant = new Date() } = {}) => {
+  const numero = await recupererNumero(numberId)
+  if (!numero || String(numero.user_id) !== String(userId)) return { statut: 'NUMERO_INTROUVABLE' }
 
-    if (avatarAutorise = true){
-        profil.avatar_url = profilOrigine.avatar_url
-    } else {
-        profil.avatar_url = null
-    }
+  const profilOrigine = await recupererProfilOrigine(userId)
+  if (!profilOrigine) return { statut: 'PROFIL_INTROUVABLE' }
 
-    return profil
+  const paysDestination = numero.country_iso
+
+  let etatNom = await lireConsentement(userId, paysDestination, TYPE_PROFIL, maintenant)
+  if (etatNom === CONSENTEMENT_ABSENT || etatNom === CONSENTEMENT_EXPIRE) {
+    await enregistrerConsentementDefaut(userId, paysDestination, maintenant)
+    etatNom = CONSENTEMENT_ACCORDE
+  }
+  const nomAutorise = etatNom === CONSENTEMENT_ACCORDE
+
+  let avatarAutorise = (await lireConsentement(userId, paysDestination, TYPE_AVATAR, maintenant)) === CONSENTEMENT_ACCORDE
+  let partiel = false
+  if (avatarAutorise && verifierPaysInterditPhoto(paysDestination)) {
+    avatarAutorise = false
+    partiel = true
+    logger.info('Synchronisation partielle : partage de photo interdit dans le pays', { userId, paysDestination })
+  }
+
+  const badge = determinerBadgeKYC(profilOrigine)
+  const profilMiroir = construireProfilMiroir(profilOrigine, nomAutorise, avatarAutorise, badge)
+  const numeroMisAJour = await enregistrerProfilMiroir(numberId, profilMiroir)
+
+  logger.info('Profil miroir synchronisé', { userId, numberId, badge })
+  return {
+    statut: partiel ? 'SYNCHRONISE_PARTIEL' : 'SYNCHRONISE',
+    nomAutorise,
+    avatarAutorise,
+    profilMiroir,
+    numero: numeroMisAJour
+  }
 }
 
-const verifierNumeroPersistant = async (numberId) =>{
-    let resultat
-
-    try{
-        const {data, error} =await supabase
-        .from('virtual_number')
-        .select('*')
-        .eq('number_id', numberId)
-        .maybeSingle()
-
-        if (error){
-            resultat = null
-        } else {
-            resultat = data
-        }
-        console.log(resultat)
-    } catch (error){
-        console.error("Une erreur est survenue:", error)
-    }
-
-    if (resultat != null){
-        return resultat
-    } else {
-        return null
-    }
-}
-
-// procédures
-const enregistrerProfilMiroir = async (numberId, profilMiroir) =>{
-
-    try{
-        const {data, error} = await supabase
-        .from('virtual_number')
-        .update ({
-            mirror_display_name: profilMiroir.display_name,
-            mirro_avatar_url: profilMiroir.avatar_url,
-            mirror_synced_at: new Date().toISOString(),
-        })
-        .eq('number_id', numberId)
-    } catch (error){
-        console.error("Une erreur est survenue:", error)
-        return
-    }
-    console.log("Profil miroir enregistré pour numéro" + numberId)
-}
-
-const enregistrerConsentmentDefaut = (userId, paysDestination) =>{
-
-    try{
-        const {data, error} = await supabase
-        .from('data_sovereignty_consent')
-        .insert([
-            {
-                user_id: userId,
-                destination_country: paysDestination,
-                data_type: typeProfil,
-                is_granted: true,
-                granted_at: new Date().toISOString(),
-                expires_at: new Date().toISOString(),
-                legal_basis: "CONTRACTUAL", 
-            }
-        ])
-    } catch (error){
-        console.error("Une erreur est survenue:", error)
-        return null
-    }
-
-    console.log("Consentement nom par défaut créé")
-    console.log("Pays :" + paysDestination)
-    console.log("Expiration :" + DelaiExpiration + "jours")
-}
-
-const notifierSynchronisation = (userId, numberId, profilMiroir) =>{
-
-    console.log("══════════════════════════════════════")
-    console.log("PROFIL MIROIR SYNCHRONISÉ")
-    console.log("══════════════════════════════════════")
-    console.log("Utilisateur : " + userId)
-    console.log("Numéro      : " + numberId)
-    console.log("Nom affiché : " + profilMiroir.display_name)
-    console.log("Avatar      : " + profilMiroir.avatar_url)
-    console.log("Badge KYC   : " + profilMiroir.kyc_badge)
-    console.log("Filiale     : " + profilMiroir.home_affiliate)
-    console.log("══════════════════════════════════════")
-}
-
-const signalerSynchronisationPartielle = (userId, raison) =>{
-
-    console.log("Synchronisation partielle pour " + userId)
-    console.log("Raison : " + raison)
-    console.log("Nom synchronisé uniquement — avatar ignoré")
-}
-
-const signalerErreurProfil = (userId) =>{
-
-    console.log("Erreur : profil Orange introuvable")
-    console.log("Utilisateur : " + userId)
-    console.log("Synchronisation annulée")
-}
-
-const signalerErreurNumero = (numberId) =>{
-
-    console.log("Erreur : numéro virtuel introuvable")
-    console.log("Numéro ID : " + numberId)
-    console.log("Synchronisation annulée")
-}
-
-// traitement principal
-const synchroniserProfilMiroir = () =>{
-
-    const numeroVirtuel = await verifierNumeroPersistant(numberId)
-    if (numeroVirtuel === null){
-        signalerErreurNumero(numberId)
-        return null
-    }
-
-    const aysDestination = numeroVirtuel.country_iso
-
-    const profilOrigine = recupererProfilOrigine(userId)
-
-    if (profilOrigine === null){
-        signalerErreurProfil(userId)
-        return null
-    }
-
-    let nomAutorise = await verifierConsentementNom(userId, paysDestination)
-
-    if (nomAutorise === false){
-        await enregistrerConsentementDefaut (userId, paysDestination)
-        nomAutorise = true
-    }
-
-    let avatarAutorise = await verifierConsentement(userId, paysDestination)
-
-    if (verifierPaysInterditPhoto(paysDestination) === true){
-        avatarAutorise = false
-        signalerSynchronisationPartielle(userId, "pays" + paysDestination + "interdit le partage photo")
-    }
-
-    const badge = determinerBadgeKYC(origine)
-    const profilMiroir = construireProfilMiroir(profilOrigine, nomAutorise, avatarAutorise, badge)
-
-    await enregistrerProfilMiroir(numberId, profilMiroir)
-
-    notifierSynchronisation(userId, numberId, profilMiroir)
-    const synchronisationOk = true
-    return synchronisationOk
+module.exports = {
+  NOM_PAR_DEFAUT,
+  DUREE_CONSENTEMENT_JOURS,
+  CONSENTEMENT_ACCORDE,
+  CONSENTEMENT_REFUSE,
+  lireConsentement,
+  verifierPaysInterditPhoto,
+  determinerBadgeKYC,
+  nomAffichable,
+  construireProfilMiroir,
+  synchroniserProfilMiroir
 }

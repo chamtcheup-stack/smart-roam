@@ -1,236 +1,168 @@
-const supabase = require ('../supabase')
+'use strict'
 
-const crypto = require('crypto');
-const argon2 = require('argon2');
-const bcrypt = require('bcrypt');
-const supabase = require('../supabase');
+// ════════════════════════════════════════════════════════════
+// ALGO 11 — Hachage et vérification des PIN
+//
+// argon2 / bcrypt (modules natifs non installés) sont remplacés par
+// scrypt, fonction mémoire-intensive native de Node et alternative
+// recommandée par l'OWASP (N=2^15, r=8, p=3 ≈ 32 Mio).
+// Un PIN à 4 chiffres n'a que 10 000 valeurs : la vraie protection
+// repose sur le poivre secret (PIN_PEPPER, HMAC-SHA256 avant scrypt)
+// et sur le verrouillage des tentatives (contrôleur).
+//
+// Format stocké (auto-descriptif, permet le re-hachage transparent) :
+//   scrypt$v=1$N=32768,r=8,p=3$poivre=1$<sel base64>$<hash base64>
+// L'ancien format (SHA-256 hex de pin + sel) reste vérifiable et
+// est converti automatiquement à la première vérification réussie.
+// ════════════════════════════════════════════════════════════
 
-const argon2Memory = 65536;
-const argon2Iteration = 3;
-const argon2Parallellisme = 4;
-const argon2Version = "ARGON2ID"
+const crypto = require('crypto')
+const { promisify } = require('util')
+const supabase = require('../supabase')
+const config = require('../config')
+const logger = require('../utils/logger')
+const { donnees } = require('../utils/db')
 
-const bcryptRounds = 12;
-const tailleSel = 16;
+const scryptAsync = promisify(crypto.scrypt)
 
-const genererSel = () =>{
-    let sel;
+const ALGORITHME = 'scrypt'
+const VERSION = 1
+const PARAMETRES = Object.freeze({ N: 2 ** 15, r: 8, p: 3 })
+const TAILLE_SEL = 16
+const TAILLE_HASH = 32
+const MEMOIRE_MAX = 64 * 1024 * 1024
 
-    sel = crypto.randomBytes(tailleSel).toString('hex');
-    return sel;
-};
+// PIN triviaux refusés à la création (chiffres identiques, suites).
+const PIN_TRIVIAUX = new Set([
+  '0000', '1111', '2222', '3333', '4444', '5555', '6666', '7777', '8888', '9999',
+  '0123', '1234', '2345', '3456', '4567', '5678', '6789',
+  '9876', '8765', '7654', '6543', '5432', '4321', '3210'
+])
 
+const estPINTrivial = (pin) => PIN_TRIVIAUX.has(pin)
 
-const detecterAlgorithme = () =>{
-    let algorithme;
+const genererSel = () => crypto.randomBytes(TAILLE_SEL)
 
-    if (argon2Disponible() === true){
-        algorithme = "argon2";
-    } else {
-        algorithme = "bcrypt"
-    }
-    return algorithme;
-};
+const preparerEntree = (pin, avecPoivre) => (avecPoivre
+  ? crypto.createHmac('sha256', config.pinPepper).update(pin, 'utf8').digest()
+  : Buffer.from(pin, 'utf8'))
 
+const deriver = (entree, sel, { N, r, p }) =>
+  scryptAsync(entree, sel, TAILLE_HASH, { N, r, p, maxmem: MEMOIRE_MAX })
 
-const hacherAvecArgon2 = async (pinBrut, sel) => {
-    try {
-        const hash = await argon2.hash(pinBrut + sel, {
-            type: argon2.argon2id,
-            memoryCost: argon2Memory,
-            timeCost: argon2Iteration,
-            parallelism: argon2Parallellisme
-        });
-        return hash;
-    } catch (error) {
-        console.error("Erreur lors du hachage Argon2 :", error);
-        return null;
-    }
-};
+const comparerTempsConstant = (a, b) => a.length === b.length && crypto.timingSafeEqual(a, b)
 
-
-const hacherAvecBcrypt = async (pinBrut, sel) => {
-    try {
-        const hash = await bcrypt.hash(pinBrut + sel, BCRYPT_ROUNDS);
-        return hash;
-    } catch (error) {
-        console.error("Erreur lors du hachage Bcrypt :", error);
-        return null;
-    }
-};
-
-
-const verifierParametreActuels = async (userId) =>{
-    let resultat;
-    let versionHash
-
-    try{
-        const {data, error} = await supabase
-        .from('users')
-        .select ('pin_hash')
-        .eq('user_id', userId)
-
-        if (error){
-            resultat = null;
-        } else {
-            resultat = data;
-        }
-
-        const contientArgon2 = resultat.pin_hash.includes('argon2id');
-        const contientMemoireAJour = resultat.pin_hash.includes(`m=${ARGON2_MEMORY}`);
-
-    } catch (error){
-        console.error("Une erreur est survenue :", error)
-        return null;
-    }
-
-    if (resultat === null){
-        return false
-    }
-
-    if ((versionHash === argon2Hash) && (argon2MemoryUtilisee(resultat.pin_hash) === argon2Memory)){
-        return true;
-    } else {
-        return false;
-    }
+const hacherPIN = async (pin) => {
+  const sel = genererSel()
+  const avecPoivre = Boolean(config.pinPepper)
+  const hash = await deriver(preparerEntree(pin, avecPoivre), sel, PARAMETRES)
+  const { N, r, p } = PARAMETRES
+  return {
+    hash: `${ALGORITHME}$v=${VERSION}$N=${N},r=${r},p=${p}$poivre=${avecPoivre ? 1 : 0}$${sel.toString('base64')}$${hash.toString('base64')}`,
+    sel: sel.toString('base64')
+  }
 }
 
+const estPuissanceDeDeux = (n) => Number.isInteger(n) && n > 1 && (n & (n - 1)) === 0
 
-const comparerHash = (hashCalcule, hashStocke) => {
-    if (!hashCalcule || !hashStocke) return false;
-    
-    // crypto.timingSafeEqual empêche un pirate de deviner la chaîne 
-    // en mesurant le temps de réponse de la comparaison
-    const bufA = Buffer.from(hashCalcule);
-    const bufB = Buffer.from(hashStocke);
+const analyserHash = (chaine) => {
+  if (typeof chaine !== 'string') return null
+  const parties = chaine.split('$')
+  if (parties.length !== 6 || parties[0] !== ALGORITHME) return null
 
-    if (bufA.length !== bufB.length) return false;
+  const version = Number((parties[1].match(/^v=(\d+)$/) || [])[1])
+  const params = Object.fromEntries(parties[2].split(',').map((paire) => {
+    const [cle, valeur] = paire.split('=')
+    return [cle, Number(valeur)]
+  }))
+  const poivre = parties[3].match(/^poivre=([01])$/)
 
-    return crypto.timingSafeEqual(bufA, bufB);
-};
+  if (!version || !poivre || !estPuissanceDeDeux(params.N) || !(params.r > 0) || !(params.p > 0)) return null
+  return {
+    version,
+    params: { N: params.N, r: params.r, p: params.p },
+    avecPoivre: poivre[1] === '1',
+    sel: Buffer.from(parties[4], 'base64'),
+    hash: Buffer.from(parties[5], 'base64')
+  }
+}
 
+const parametresAJour = (analyse) =>
+  analyse.version === VERSION &&
+  analyse.params.N === PARAMETRES.N &&
+  analyse.params.r === PARAMETRES.r &&
+  analyse.params.p === PARAMETRES.p &&
+  analyse.avecPoivre === Boolean(config.pinPepper)
 
-const recupererHashEtSel = async (userId) =>{
-    let resultat;
+// Ancien format du contrôleur historique : SHA-256(pin + sel) en hexadécimal.
+const verifierAncienFormat = (pin, hashStocke, selStocke) => {
+  if (!/^[0-9a-f]{64}$/i.test(hashStocke) || !selStocke) return false
+  const calcule = crypto.createHash('sha256').update(pin + selStocke).digest()
+  return comparerTempsConstant(calcule, Buffer.from(hashStocke, 'hex'))
+}
 
+// Vérification pure : { valide, doitRehacher }.
+const verifierPIN = async (pin, hashStocke, selStocke) => {
+  if (!hashStocke) return { valide: false, doitRehacher: false }
+
+  const analyse = analyserHash(hashStocke)
+  if (!analyse) {
+    const valide = verifierAncienFormat(pin, hashStocke, selStocke)
+    return { valide, doitRehacher: valide }
+  }
+
+  if (analyse.avecPoivre && !config.pinPepper) {
+    logger.error('PIN haché avec poivre mais PIN_PEPPER absent de la configuration')
+    return { valide: false, doitRehacher: false }
+  }
+
+  const calcule = await deriver(preparerEntree(pin, analyse.avecPoivre), analyse.sel, analyse.params)
+  const valide = comparerTempsConstant(calcule, analyse.hash)
+  return { valide, doitRehacher: valide && !parametresAJour(analyse) }
+}
+
+// Calcul factice de même coût : évite de révéler par le temps de réponse
+// qu'un compte n'existe pas ou n'a pas de PIN.
+const simulerVerification = async () => {
+  await deriver(Buffer.from('0000'), genererSel(), PARAMETRES)
+  return { valide: false, doitRehacher: false }
+}
+
+// ── Accès base ──────────────────────────────────────────────
+const sauvegarderHash = async (userId, pin) => {
+  const { hash, sel } = await hacherPIN(pin)
+  donnees(
+    await supabase.from('users').update({ pin_hash: hash, pin_salt: sel }).eq('user_id', userId),
+    'sauvegarde du PIN'
+  )
+  logger.info('PIN haché et sauvegardé', { userId, algorithme: ALGORITHME })
+}
+
+// Vérifie le PIN d'un utilisateur déjà chargé ({ user_id, pin_hash, pin_salt })
+// et ré-hache automatiquement si le format ou les paramètres sont obsolètes.
+const verifierPINUtilisateur = async (utilisateur, pin) => {
+  if (!utilisateur || !utilisateur.pin_hash) return simulerVerification()
+
+  const resultat = await verifierPIN(pin, utilisateur.pin_hash, utilisateur.pin_salt)
+  if (resultat.valide && resultat.doitRehacher) {
     try {
-        const {data, error} = await supabase
-        .from('users')
-        .select('pin_hash & pin_salt')
-        .eq('user_id', userId)
-        .maybeSingle()
-
-        if (error){
-            resultat = null;
-        } else {
-            resultat = data;
-        }
-        console.log(resultat);
-    } catch (error){
-        console.error("Une erreur est survenue :", error)
-        return null;
+      await sauvegarderHash(utilisateur.user_id, pin)
+      logger.info('PIN ré-haché avec les paramètres actuels', { userId: utilisateur.user_id })
+    } catch (erreur) {
+      logger.warn('Ré-hachage du PIN impossible (vérification conservée)', erreur)
     }
+  }
+  return resultat
+}
 
-    if (resultat != null){
-        return resultat;
-    } else {
-        return null;
-    }
-};
-
-// procédures
-const sauvegarderHash = async (userId, hash, sel , algo) =>{
-
-    try{
-        const {data, error} = await supabase
-        .from('users')
-        .update  ({
-            pin_hash : hash,
-            pin_salt : sel,
-            updated_at : new Date().toISOString(),
-        })
-        .eq('user_id', userId)
-        
-        if (error) throw error;
-
-        console.log(`PIN haché et sauvegardé pour : ${userId}`);
-        console.log(`Algorithme utilisé : ${algo}`);
-
-    } catch (error){
-        console.error("Une erreur est survenue :", error)
-        return null;
-    }
-
-    
-};
-
-
-const rehacherPin = async (userId, pinBrut) =>{
-    
-
-    console.log("Rehashing automatique pour" + userId)
-    console.log("Paamètres mis à jour versargon2id")
-
-    const nouveauSel =genererSel()
-    const nouveauHash = hacherAvecArgon2(pinBrut, nouveauSel)
-
-    await sauvegarderHash(userId, nouveauHash, nouveauSel, "ARGON2")
-};
-
-
-const signalerPINInvalide = (userId) =>{
-
-    console.log("PIN incorrect pour l'utilisateur" + userId)
-    console.log("Tentative de connexion échouéé")
-};
-
-// traitement principal avec PIN
-const creerHashPIN = async (userId) =>{
-    const sel = genererSel;
-    const algorithme = detecterAlgorithme()
-    let hashResultat;
-
-    if (algorithme === "argon2"){
-        hashResultat = awaithacherAvecArgon2(pinBrut, sel)
-    } else {
-        hashResultat = await hacherAvecBcrypt(pinBrut, sel)
-    }
-
-    await sauvegarderHash(userId, hashResultat, sel, algorithme)
-    return hashResultat;
-};
-
-
-const verifierPIN = async (userId, pinSaisi) =>{
-
-    const donne = await recupererHashEtSel(userId)
-    if (donnee === null){
-        console.log("Utilisateur introuvable :" + userId)
-        return false;
-    }
-
-    const pinStocke = donnee.pin_hash
-    const selStpcke = donne.pin_salt
-
-    const algorithme = detecterAlgorithme()
-    let hashVerification;
-
-    if (algorithme === "argon2"){
-        hashVerifiction = await hacherAvecArgon2(pinSaisi , selStocke)
-    } else {
-        hashVerification = await hacherAvecBcrypt(pinSaisi, selStocke)
-    }
-
-    const pinValide = comparerHash(hashVerification, pinStocke)
-    if (pinValide === false){
-        signalerPINInvalide(userId)
-        return false;
-    }
-
-    const parametreOk = verifierParametreActuels(userId)
-    if (parametreOk === false){
-        await rehacherPin(userId, pinSaisi)
-    }
-
-    return true;
-};
+module.exports = {
+  hacherPIN,
+  verifierPIN,
+  verifierPINUtilisateur,
+  simulerVerification,
+  sauvegarderHash,
+  analyserHash,
+  parametresAJour,
+  estPINTrivial,
+  PARAMETRES
+}
