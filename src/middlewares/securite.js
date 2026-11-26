@@ -32,7 +32,9 @@ const optionsCors = {
   origin: (origine, rappel) => rappel(null, !origine || config.corsOrigins.includes(origine)),
   methods: ['GET', 'POST', 'PUT', 'DELETE'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-API-Key', 'Idempotency-Key'],
-  exposedHeaders: ['Retry-After', 'RateLimit-Limit', 'RateLimit-Remaining'],
+  // Lisibles par une application web (Expo web, back-office) : rejeu idempotent,
+  // référence de requête (support), mode démo, limites de débit.
+  exposedHeaders: ['Retry-After', 'RateLimit-Limit', 'RateLimit-Remaining', 'Idempotent-Replayed', 'X-Request-Id', 'X-Smart-Roam-Mode'],
   maxAge: 600
 }
 

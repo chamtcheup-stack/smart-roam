@@ -5,7 +5,9 @@ const {
   connexion,
   rafraichir,
   deconnexion,
-  deconnexionGlobale
+  deconnexionGlobale,
+  demanderCodeOTP,
+  reinitialiserPINOublie
 } = require('../controllers/authController')
 const { authentifier, exigerRole, ROLES } = require('../middlewares/auth')
 const config = require('../config')
@@ -25,8 +27,18 @@ const limiteurConnexion = limiterDebit({
 // Un refresh token ne sert qu'une fois et n'est pas devinable : plafond anti-abus seulement.
 const limiteurRefresh = limiterDebit({ fenetreMs: QUINZE_MINUTES, max: 1000 })
 
+// Codes SMS : quotas par numéro dans utils/otp (1 par minute, 5 par heure) ;
+// plafond par IP volontairement large (CGNAT).
+const limiteurOTP = limiterDebit({
+  fenetreMs: QUINZE_MINUTES,
+  max: 100,
+  message: 'Trop de demandes de code depuis cette adresse, réessayez plus tard'
+})
+
 router.post('/login', limiteurConnexion, connexion)
 router.post('/refresh', limiteurRefresh, rafraichir)
+router.post('/otp', limiteurOTP, demanderCodeOTP)
+router.post('/pin-oublie', limiteurOTP, reinitialiserPINOublie)
 router.post('/logout', authentifier, exigerRole(ROLES.USER, ROLES.ADMIN), deconnexion)
 router.post('/logout-all', authentifier, exigerRole(ROLES.USER, ROLES.ADMIN), deconnexionGlobale)
 

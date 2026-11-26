@@ -7,7 +7,9 @@
 // Wi-Fi, IP), scorés par l'algo 08 :
 //   - arrivée dans le pays déclaré (score ≥ 70)  → numéro virtuel activé
 //   - retour dans le pays d'origine (score ≥ 70) → mode parking
-//   - score intermédiaire (50–69)                → attente d'un signal
+//   - encore dans le pays d'origine avant départ → attente du départ
+//   - score intermédiaire (50–69) de l'évènement
+//     attendu (arrivée ou retour)                 → attente d'un signal
 //   - autre pays                                  → escale ignorée
 // Le voyage actif est la dernière déclaration PENDING (arrivée attendue)
 // ou CONFIRMED (voyageur sur place, retour attendu).
@@ -151,26 +153,33 @@ const fusionMultiSignaux = async (userId, signaux) => {
     return { decision: 'RETOUR_DETECTE', scoreConfiance: scoreOrigine.scoreFinal, numerosParkes, ...contexte }
   }
 
-  // Voyageur déjà arrivé qui renvoie des signaux depuis la destination
-  if (enVoyage && paysDetecte === paysDestination && scoreDestination.scoreFinal >= SEUIL_HAUTE) {
+  // Voyageur déjà arrivé qui renvoie des signaux depuis la destination : rien à faire.
+  if (enVoyage && paysDetecte === paysDestination) {
     return { decision: 'DEJA_SUR_PLACE', scoreConfiance: scoreDestination.scoreFinal, ...contexte }
   }
 
-  const scorePertinent = Math.max(scoreDestination.scoreFinal, scoreOrigine.scoreFinal)
+  // Voyage déclaré, voyageur encore dans son pays d'origine : le numéro attend
+  // l'arrivée (ni « signaux insuffisants », ni nouvel essai inutile).
+  if (!enVoyage && paysOrigine && paysDetecte === paysOrigine) {
+    return { decision: 'PAS_ENCORE_PARTI', scoreConfiance: scoreOrigine.scoreFinal, ...contexte }
+  }
+
+  // Score de l'évènement attendu : l'arrivée (voyage déclaré) ou le retour (sur place).
+  const scoreAttendu = enVoyage ? scoreOrigine.scoreFinal : scoreDestination.scoreFinal
 
   // 3. Score intermédiaire : le client renvoie ses signaux quelques secondes plus tard
-  if (scorePertinent >= SEUIL_MOYENNE && scorePertinent < SEUIL_HAUTE) {
-    return { decision: 'ATTENTE_SIGNAL_SUPPLEMENTAIRE', scoreConfiance: scorePertinent, reessayerDansSecondes: DUREE_ATTENTE_SECONDES, ...contexte }
+  if (scoreAttendu >= SEUIL_MOYENNE && scoreAttendu < SEUIL_HAUTE) {
+    return { decision: 'ATTENTE_SIGNAL_SUPPLEMENTAIRE', scoreConfiance: scoreAttendu, reessayerDansSecondes: DUREE_ATTENTE_SECONDES, ...contexte }
   }
 
   // 4. Pays sans rapport avec le voyage (escale probable)
   if (paysDetecte && paysDetecte !== paysDestination && paysDetecte !== paysOrigine) {
     logger.debug('Signal ignoré : pays non pertinent (escale probable)', { userId, paysDetecte })
-    return { decision: 'ESCALE_IGNOREE', scoreConfiance: scorePertinent, ...contexte }
+    return { decision: 'ESCALE_IGNOREE', scoreConfiance: scoreAttendu, ...contexte }
   }
 
   // 5. Score trop faible
-  return { decision: 'SCORE_INSUFFISANT', scoreConfiance: scorePertinent, ...contexte }
+  return { decision: 'SCORE_INSUFFISANT', scoreConfiance: scoreAttendu, ...contexte }
 }
 
 module.exports = {

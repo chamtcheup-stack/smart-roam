@@ -14,21 +14,27 @@ const DELAI_ARRET_FORCE_MS = 10000
 
 for (const avertissement of config.avertissements) logger.warn(avertissement)
 
-const app = creerApp()
+let serveur = null
 
-const serveur = app.listen(config.port, () => {
-  logger.info(`Serveur Smart Roam démarré sur le port ${config.port} (${config.environnement})`)
-  demarrerTachesPlanifiees()
-})
+const demarrer = async () => {
+  // Mode démo : données fictives chargées avant d'accepter la moindre requête.
+  if (config.demo) await require('./src/demo/pilotageDemo').initialiserDemo()
 
-serveur.on('error', (erreur) => {
-  if (erreur.code === 'EADDRINUSE') {
-    logger.error(`Le port ${config.port} est déjà utilisé`)
-  } else {
-    logger.error('Erreur du serveur HTTP', erreur)
-  }
-  process.exit(1)
-})
+  serveur = creerApp().listen(config.port, () => {
+    logger.info(`Serveur Smart Roam démarré sur le port ${config.port} (${config.environnement}${config.demo ? ', MODE DÉMO' : ''})`)
+    if (config.demo) process.stdout.write(require('./src/demo/banniere').banniereDemo(config.port))
+    demarrerTachesPlanifiees()
+  })
+
+  serveur.on('error', (erreur) => {
+    if (erreur.code === 'EADDRINUSE') {
+      logger.error(`Le port ${config.port} est déjà utilisé`)
+    } else {
+      logger.error('Erreur du serveur HTTP', erreur)
+    }
+    process.exit(1)
+  })
+}
 
 // ── Arrêt propre ──────────────────────────────────────────
 let arretEnCours = false
@@ -37,6 +43,7 @@ const arreter = (signal) => {
   arretEnCours = true
   logger.info(`${signal} reçu : arrêt en cours…`)
   arreterTachesPlanifiees()
+  if (!serveur) process.exit(0)
   serveur.close(() => {
     logger.info('Serveur arrêté proprement')
     process.exit(0)
@@ -51,4 +58,9 @@ process.on('SIGTERM', () => arreter('SIGTERM'))
 process.on('SIGINT', () => arreter('SIGINT'))
 process.on('unhandledRejection', (raison) => {
   logger.error('Promesse rejetée non gérée', raison instanceof Error ? raison : { raison: String(raison) })
+})
+
+demarrer().catch((erreur) => {
+  logger.error('Démarrage impossible', erreur)
+  process.exit(1)
 })

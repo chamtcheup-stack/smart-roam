@@ -6,7 +6,7 @@
 // Règles (la première déclenchée l'emporte) :
 //   MONTANT      montant > 5 × moyenne habituelle          → score 85
 //   FREQUENCE    > 20 transactions confirmées dans l'heure   → score 90
-//   LOCALISATION pays de la transaction inhabituel           → score 60
+//   LOCALISATION pays inhabituel (hors voyage déclaré)       → score 60
 //   DEVICE       appareil inconnu depuis 90 jours            → score 70
 // Sinon, score statistique (écarts au profil) : 40 × écart montant
 // + 30 × écart fréquence journalière, borné à 100.
@@ -150,6 +150,8 @@ const evaluerRegleDeterministe = (regle, transaction, profil, contexte) => {
         ? { declenche: true, typeAnomalie: 'FREQUENCY', score: 90 }
         : NON_DECLENCHEE
     case 'LOCALISATION':
+      // Pays d'un voyage déclaré et confirmé : attendu, donc jamais inhabituel.
+      if (transaction.voyage_declare === true) return NON_DECLENCHEE
       return verifierPaysHabituel(profil, transaction.pays) === false
         ? { declenche: true, typeAnomalie: 'LOCATION', score: 60 }
         : NON_DECLENCHEE
@@ -162,11 +164,18 @@ const evaluerRegleDeterministe = (regle, transaction, profil, contexte) => {
   }
 }
 
+// Seuls les DÉPASSEMENTS comptent : un montant plus faible ou une activité plus
+// calme que d'habitude ne sont pas suspects. La transaction en cours compte
+// dans l'activité du jour ; la première transaction de la journée n'est
+// jamais pénalisée, même pour un profil peu actif (moyenne < 1 par jour).
 const calculerScoreML = (transaction, profil, nbTransactions24h) => {
   const moyenneMontant = Number(profil.avg_transaction_amount) || 0
   const moyenneQuotidienne = Number(profil.avg_daily_transactions) || 0
-  const ecartMontant = moyenneMontant > 0 ? Math.abs(transaction.montant - moyenneMontant) / moyenneMontant : 0
-  const ecartFrequence = moyenneQuotidienne > 0 ? Math.abs(nbTransactions24h - moyenneQuotidienne) / moyenneQuotidienne : 0
+  const ecartMontant = moyenneMontant > 0 ? Math.max(0, transaction.montant - moyenneMontant) / moyenneMontant : 0
+  const habituelParJour = Math.max(1, Math.ceil(moyenneQuotidienne))
+  const ecartFrequence = moyenneQuotidienne > 0
+    ? Math.max(0, nbTransactions24h + 1 - habituelParJour) / habituelParJour
+    : 0
   return Math.min(100, Math.round(ecartMontant * 40 + ecartFrequence * 30))
 }
 
@@ -251,7 +260,7 @@ const apprendreTransaction = async (userId, transaction, { maintenant = new Date
 }
 
 // ── Traitement principal ────────────────────────────────────
-// transaction : { montant, devise?, pays?, device_id?, appareil_connu?, transaction_id? }
+// transaction : { montant, devise?, pays?, voyage_declare?, device_id?, appareil_connu?, transaction_id? }
 // appareil_connu (issu du jeton de session) évite une requête sur la table device.
 const detectionFraudeIA = async (userId, transaction, { maintenant = new Date() } = {}) => {
   const profil = await recupererProfilNormal(userId)

@@ -8,7 +8,9 @@
     "start": "node server.js",
     "dev": "node --watch server.js",
     "test": "node --test \"test/**/*.test.js\"",
-    "verifier:schema": "node scripts/verifier-schema.js"
+    "verifier:schema": "node scripts/verifier-schema.js",
+    "demo": "node scripts/demo-scenario.js",
+    "demo:serveur": "node scripts/demo-serveur.js"
   },
   "engines": {
     "node": ">=22"

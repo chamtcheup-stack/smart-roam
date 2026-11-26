@@ -32,6 +32,8 @@ tags:
   - name: Miroir
   - name: Prédiction
   - name: Stock
+  - name: Démo
+    description: Présentes uniquement en mode démo (DEMO_MODE=true, données fictives, refusé en production).
 
 paths:
   /:
@@ -96,6 +98,53 @@ paths:
                   tokens: { $ref: '#/components/schemas/Jetons' }
         '400': { $ref: '#/components/responses/RequeteInvalide' }
         '401': { $ref: '#/components/responses/NonAuthentifie' }
+        '429': { $ref: '#/components/responses/TropDeRequetes' }
+  /api/auth/otp:
+    post:
+      tags: [Authentification]
+      summary: Recevoir un code de vérification par SMS (6 chiffres, 5 minutes)
+      description: |
+        Motif INSCRIPTION (numéro non encore enregistré, sinon 409) ou PIN_OUBLIE
+        (réponse identique que le numéro existe ou non). Un code par minute et
+        5 par heure pour un même numéro ; 5 essais par code. En mode démo, le code
+        est renvoyé dans le champ codeDemo.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [phoneNumber, motif]
+              properties:
+                phoneNumber: { type: string, example: '+237699123456' }
+                motif: { type: string, enum: [INSCRIPTION, PIN_OUBLIE] }
+      responses:
+        '200': { description: 'Code envoyé : expireDansSecondes, renvoiPossibleDansSecondes (codeDemo en démo)' }
+        '400': { $ref: '#/components/responses/RequeteInvalide' }
+        '409': { $ref: '#/components/responses/Conflit' }
+        '429': { $ref: '#/components/responses/TropDeRequetes' }
+        '503': { description: Aucun fournisseur SMS configuré }
+  /api/auth/pin-oublie:
+    post:
+      tags: [Authentification]
+      summary: Définir un nouveau PIN après vérification du numéro par SMS
+      description: Toutes les sessions du compte sont fermées ; le verrouillage anti-force brute est levé.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [phoneNumber, otpCode, nouveauPin]
+              properties:
+                phoneNumber: { type: string }
+                otpCode: { type: string, example: '482913' }
+                nouveauPin: { type: string, pattern: '^\d{4}$' }
+      responses:
+        '200': { description: PIN réinitialisé }
+        '400': { description: 'Code incorrect (essaisRestants), expiré, ou PIN trop simple' }
         '429': { $ref: '#/components/responses/TropDeRequetes' }
   /api/auth/refresh:
     post:
@@ -185,11 +234,28 @@ paths:
       - $ref: '#/components/parameters/UserIdChemin'
     get:
       tags: [Utilisateurs]
-      summary: Profil (liste blanche de champs)
+      summary: Profil (liste blanche de champs) et rôle (USER / ADMIN)
       responses:
         '200': { description: Profil }
         '403': { $ref: '#/components/responses/Interdit' }
         '404': { $ref: '#/components/responses/Introuvable' }
+    put:
+      tags: [Utilisateurs]
+      summary: Modifier le nom affiché (profils miroir resynchronisés)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [displayName]
+              properties:
+                displayName: { type: string, minLength: 2, maxLength: 60, example: Awa Ngono }
+      responses:
+        '200': { description: Profil mis à jour }
+        '400': { $ref: '#/components/responses/RequeteInvalide' }
+        '404': { $ref: '#/components/responses/Introuvable' }
+        '503': { description: Colonne users.display_name absente de la base }
     delete:
       tags: [Utilisateurs]
       summary: Supprimer le compte (suppression logique)
@@ -318,6 +384,37 @@ paths:
                 payload: { oneOf: [{ type: string }, { type: object }] }
       responses:
         '200': { description: 'Décision ALLOW, BLOCK ou CAPTCHA' }
+  /api/security/fraud-alerts:
+    get:
+      tags: [Sécurité]
+      summary: Alertes de fraude, les plus récentes d'abord (ADMIN / SERVICE)
+      security:
+        - bearerAuth: []
+        - cleService: []
+      parameters:
+        - { name: userId, in: query, required: false, schema: { type: string }, description: Limiter aux alertes d'un compte }
+        - $ref: '#/components/parameters/Limite'
+        - $ref: '#/components/parameters/Decalage'
+      responses:
+        '200': { description: 'Page d''alertes ; disponible=false si la table fraud_alert n''existe pas' }
+        '403': { $ref: '#/components/responses/Interdit' }
+  /api/security/numbers/{numberId}/reactivate:
+    put:
+      tags: [Sécurité]
+      summary: Lever la suspension anti-fraude d'un numéro (ADMIN / SERVICE)
+      description: |
+        Après vérification de l'identité du titulaire par le support. Statut rétabli
+        selon le voyage : ACTIVE (voyage confirmé), AWAITING_ARRIVAL (voyage déclaré),
+        PARKED sinon.
+      security:
+        - bearerAuth: []
+        - cleService: []
+      parameters:
+        - { name: numberId, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: Suspension levée }
+        '404': { $ref: '#/components/responses/Introuvable' }
+        '409': { $ref: '#/components/responses/Conflit' }
 
   /api/declarations/new:
     post:
@@ -648,6 +745,24 @@ paths:
         - $ref: '#/components/parameters/Decalage'
       responses:
         '200': { description: Page de profils }
+  /api/mirror/consents/{userId}:
+    get:
+      tags: [Miroir]
+      summary: Consentements de partage (état ACCORDE, REFUSE ou EXPIRE)
+      parameters:
+        - $ref: '#/components/parameters/UserIdChemin'
+        - $ref: '#/components/parameters/Limite'
+        - $ref: '#/components/parameters/Decalage'
+      responses:
+        '200': { description: Page de consentements }
+
+  /api/pays:
+    get:
+      tags: [Supervision]
+      summary: Pays référencés (résidence, destinations où un numéro local est disponible)
+      security: []
+      responses:
+        '200': { description: 'Liste { code, nom, numerosDisponibles, zoneRoaming }' }
 
   /api/prediction/suggest:
     post:
@@ -745,6 +860,83 @@ paths:
       responses:
         '200': { description: Rapport d'analyse }
 
+  # ── Mode démo : routes présentes UNIQUEMENT si DEMO_MODE=true ──
+  /api/demo:
+    get:
+      tags: [Démo]
+      summary: Comptes fictifs (avec leur PIN), outils de simulation et étapes du scénario
+      security: []
+      responses:
+        '200': { description: Informations du mode démo }
+  /api/demo/etat:
+    get:
+      tags: [Démo]
+      summary: Vue d'ensemble (voyages, numéros, stocks, derniers évènements d'audit)
+      security: []
+      responses:
+        '200': { description: État de la démonstration }
+  /api/demo/signaux/{paysISO}:
+    get:
+      tags: [Démo]
+      summary: Signaux réseau qu'un téléphone capterait dans ce pays
+      description: À renvoyer tels quels (champ signaux) à POST /api/geolocalisation/arrivee.
+      security: []
+      parameters:
+        - { name: paysISO, in: path, required: true, schema: { type: string, example: FR } }
+      responses:
+        '200': { description: 'Signaux simulés (MCC/MNC, SSID, pays IP, Cell-ID)' }
+        '404': { $ref: '#/components/responses/Introuvable' }
+  /api/demo/appel-entrant:
+    post:
+      tags: [Démo]
+      summary: Simuler un appel entrant sur un de ses numéros (moteur de renvoi réel)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                numberId: { type: string }
+                numeroAppele: { type: string, description: Alternative à numberId (E.164) }
+                numeroAppelant: { type: string }
+                statutLigne: { type: string, enum: [LIBRE, OCCUPE, SANS_REPONSE] }
+      responses:
+        '200': { description: 'Décision RING, VOICEMAIL, FORWARD ou REJECT, expliquée' }
+        '400': { $ref: '#/components/responses/RequeteInvalide' }
+        '401': { $ref: '#/components/responses/NonAuthentifie' }
+        '404': { $ref: '#/components/responses/Introuvable' }
+  /api/demo/maintenance:
+    post:
+      tags: [Démo]
+      summary: Exécuter immédiatement les tâches planifiées de maintenance
+      security: []
+      responses:
+        '200': { description: Rapport de maintenance }
+        '429': { $ref: '#/components/responses/TropDeRequetes' }
+  /api/demo/reinitialiser:
+    post:
+      tags: [Démo]
+      summary: Remettre la démonstration dans son état initial
+      description: Tous les jetons déjà émis deviennent invalides (reconnexion nécessaire).
+      security: []
+      responses:
+        '200': { description: Démo réinitialisée }
+        '429': { $ref: '#/components/responses/TropDeRequetes' }
+  /api/demo/avatars/{fichier}:
+    get:
+      tags: [Démo]
+      summary: Photo de profil fictive (SVG aux initiales)
+      security: []
+      parameters:
+        - { name: fichier, in: path, required: true, schema: { type: string, example: awa.svg } }
+      responses:
+        '200':
+          description: Image SVG
+          content:
+            image/svg+xml: {}
+        '404': { $ref: '#/components/responses/Introuvable' }
+
 components:
   securitySchemes:
     bearerAuth:
@@ -816,6 +1008,10 @@ components:
         phoneNumber: { type: string, example: '+237699123456' }
         countryResidence: { type: string, example: CM }
         planId: { type: string }
+        otpCode:
+          type: string
+          example: '482913'
+          description: Code SMS (POST /api/auth/otp, motif INSCRIPTION) ; obligatoire si OTP_REQUIRED (production, démo).
     DemandeConversion:
       type: object
       required: [deviseSource, deviseCible, montant]

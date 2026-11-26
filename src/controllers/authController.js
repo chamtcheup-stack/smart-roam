@@ -3,13 +3,14 @@
 const supabase = require('../supabase')
 const v = require('../utils/validation')
 const logger = require('../utils/logger')
-const { nonAuthentifie, tropDeRequetes } = require('../utils/http')
+const { nonAuthentifie, tropDeRequetes, conflit, requeteInvalide } = require('../utils/http')
 const { donnees } = require('../utils/db')
 const config = require('../config')
 const { CompteurFenetre } = require('../utils/limiteur')
 const { verrouCompte, cleCompte, cleTelephone } = require('../utils/verrouCompte')
 const { auditerRequete } = require('../utils/audit')
-const { verifierPINUtilisateur } = require('../algorithms/algo11_hachagePIN')
+const { MOTIFS, envoyerCode, exigerCodeValide } = require('../utils/otp')
+const { verifierPINUtilisateur, sauvegarderHash, estPINTrivial } = require('../algorithms/algo11_hachagePIN')
 const { enregistrerAppareil } = require('../algorithms/algo07_detectionFraude')
 const {
   genererTokens,
@@ -43,11 +44,14 @@ const chargerUtilisateurActif = async (userId) => {
   return utilisateur && !utilisateur.deleted_at ? utilisateur : null
 }
 
+// Rôle et nom affiché : l'application adapte ses écrans (espace support, accueil).
 const profilPublic = (utilisateur) => ({
   user_id: utilisateur.user_id,
   phone_number: utilisateur.phone_number,
   country_of_residence: utilisateur.country_of_residence,
-  kyc_status: utilisateur.kyc_status
+  kyc_status: utilisateur.kyc_status,
+  display_name: utilisateur.display_name || null,
+  role: determinerRole(utilisateur)
 })
 
 // ════════════════════════════════════════════
@@ -123,6 +127,56 @@ const deconnexion = async (req, res) => {
 }
 
 // ════════════════════════════════════════════
+// POST /api/auth/otp   (public)
+// { phoneNumber, motif: INSCRIPTION | PIN_OUBLIE } → code à 6 chiffres par SMS
+// ════════════════════════════════════════════
+const MESSAGE_CODE_ENVOYE = 'Si ce numéro peut le recevoir, un code de vérification vient d\'être envoyé par SMS'
+
+const demanderCodeOTP = async (req, res) => {
+  v.exigerChamps(req.body, ['phoneNumber', 'motif'])
+  const telephone = v.telephone(req.body.phoneNumber, 'phoneNumber')
+  const motif = v.enumeration(req.body.motif, 'motif', { valeurs: MOTIFS, message: 'Motif invalide' })
+
+  const utilisateur = await chargerUtilisateurParTelephone(telephone)
+  // Inscription d'un numéro déjà enregistré : inutile d'envoyer un SMS.
+  if (motif === 'INSCRIPTION' && utilisateur) throw conflit('Ce numéro de téléphone est déjà enregistré : connectez-vous')
+  // PIN oublié pour un numéro inconnu : même réponse, aucun envoi (pas d'énumération).
+  if (motif === 'PIN_OUBLIE' && !utilisateur) {
+    return res.status(200).json({ message: MESSAGE_CODE_ENVOYE, expireDansSecondes: 300, renvoiPossibleDansSecondes: 60 })
+  }
+
+  const envoi = await envoyerCode(telephone, motif)
+  void auditerRequete(req, { userId: utilisateur ? utilisateur.user_id : null, entite: 'AUTH', action: `OTP_ENVOYE_${motif}` })
+  return res.status(200).json({ message: MESSAGE_CODE_ENVOYE, ...envoi })
+}
+
+// ════════════════════════════════════════════
+// POST /api/auth/pin-oublie   (public)
+// { phoneNumber, otpCode, nouveauPin } : nouveau PIN après vérification du
+// numéro par SMS ; toutes les sessions du compte sont fermées.
+// ════════════════════════════════════════════
+const reinitialiserPINOublie = async (req, res) => {
+  v.exigerChamps(req.body, ['phoneNumber', 'otpCode', 'nouveauPin'])
+  const telephone = v.telephone(req.body.phoneNumber, 'phoneNumber')
+  const code = v.chaine(req.body.otpCode, 'otpCode', { min: 4, max: 10 })
+  const nouveauPin = v.pin(req.body.nouveauPin, 'nouveauPin')
+  if (estPINTrivial(nouveauPin)) {
+    throw requeteInvalide('PIN trop simple : évitez les chiffres identiques et les suites (ex. 0000, 1234)', { champ: 'nouveauPin' })
+  }
+
+  exigerCodeValide(telephone, 'PIN_OUBLIE', code)
+  const utilisateur = await chargerUtilisateurParTelephone(telephone)
+  if (!utilisateur) throw requeteInvalide('Code expiré ou trop d\'essais : demandez un nouveau code', { champ: 'otpCode' })
+
+  await sauvegarderHash(utilisateur.user_id, nouveauPin)
+  await revoquerTousTokens(utilisateur.user_id)
+  verrouCompte.reinitialiser(cleCompte(utilisateur.user_id))
+  verrouCompte.reinitialiser(cleTelephone(telephone))
+  void auditerRequete(req, { userId: utilisateur.user_id, entite: 'SECURITY', action: 'PIN_REINITIALISE_PAR_SMS' })
+  return res.status(200).json({ message: 'PIN réinitialisé : connectez-vous avec votre nouveau PIN' })
+}
+
+// ════════════════════════════════════════════
 // POST /api/auth/logout-all (authentifié)
 // ════════════════════════════════════════════
 const deconnexionGlobale = async (req, res) => {
@@ -136,6 +190,8 @@ module.exports = {
   rafraichir,
   deconnexion,
   deconnexionGlobale,
+  demanderCodeOTP,
+  reinitialiserPINOublie,
   chargerUtilisateurActif,
   profilPublic,
   echecsParIP

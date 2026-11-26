@@ -124,8 +124,39 @@ const gererConsentement = async (req, res) => {
   })
 }
 
+// ════════════════════════════════════════════
+// GET /api/mirror/consents/:userId
+// Consentements de partage (écran « Confidentialité ») avec leur état
+// calculé : ACCORDE, REFUSE ou EXPIRE.
+// ════════════════════════════════════════════
+const etatConsentement = (consentement, maintenant) => {
+  if (!consentement.is_granted) return 'REFUSE'
+  if (consentement.expires_at && Date.parse(consentement.expires_at) <= maintenant) return 'EXPIRE'
+  return 'ACCORDE'
+}
+
+const getConsentements = async (req, res) => {
+  const page = v.pagination(req.query)
+  const { lignes, total } = await paginer(
+    supabase
+      .from('data_sovereignty_consent')
+      .select('*', { count: 'exact' })
+      .eq('user_id', req.params.userId)
+      .order('granted_at', { ascending: false }),
+    page,
+    'lecture des consentements'
+  )
+  const maintenant = Date.now()
+  return res.status(200).json({
+    consentements: lignes.map((consentement) => ({ ...consentement, etat: etatConsentement(consentement, maintenant) })),
+    total,
+    ...page
+  })
+}
+
 module.exports = {
   synchroniserMiroir,
   getProfilMiroir,
-  gererConsentement
+  gererConsentement,
+  getConsentements
 }

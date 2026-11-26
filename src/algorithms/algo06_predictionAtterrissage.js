@@ -8,7 +8,7 @@
 //   probabilité = 50 % fréquence + 30 % saisonnalité (mois ± 1, circulaire)
 //               + 20 % jour de la semaine
 // Suggestion proposée si probabilité ≥ 60 %. Le client confirme (déclaration)
-// ou refuse (enregistrerSuggestionRefusee) : pas d'interaction bloquante.
+// ou refuse (enregistrerSuggestionRefusee : destination écartée 7 jours).
 // ════════════════════════════════════════════════════════════
 
 const supabase = require('../supabase')
@@ -21,6 +21,8 @@ const MINIMUM_VOYAGES = 3
 const POIDS_FREQUENCE = 0.50
 const POIDS_SAISON = 0.30
 const POIDS_JOUR_SEMAINE = 0.20
+const DUREE_REFUS_JOURS = 7
+const MS_PAR_JOUR = 24 * 60 * 60 * 1000
 
 const dateVoyage = (voyage) => voyage.arrival_detected_at || voyage.declaration_time || voyage.created_at || null
 
@@ -109,12 +111,35 @@ const scorerDestinations = (historique, paysOrigine, maintenant = new Date()) =>
     .sort((a, b) => b.probabilite - a.probabilite)
 }
 
-const enregistrerSuggestionRefusee = async (userId, paysISO) => journaliserAudit({
-  userId,
-  entite: 'PREDICTION',
-  action: `SUGGESTION_REFUSEE_${paysISO}`,
-  acteur: 'USER'
-})
+// Suggestion refusée : non reproposée pendant 7 jours (mémoire du processus ;
+// à déplacer dans un magasin partagé en déploiement multi-instances).
+const suggestionsRefusees = new Map() // `${userId}:${paysISO}` → fin du refus (ms)
+
+const estRefuseeRecemment = (userId, paysISO, maintenant = new Date()) => {
+  const cle = `${userId}:${paysISO}`
+  const fin = suggestionsRefusees.get(cle)
+  if (!fin) return false
+  if (fin <= maintenant.getTime()) {
+    suggestionsRefusees.delete(cle)
+    return false
+  }
+  return true
+}
+
+setInterval(() => {
+  const maintenant = Date.now()
+  for (const [cle, fin] of suggestionsRefusees) if (fin <= maintenant) suggestionsRefusees.delete(cle)
+}, 60 * 60 * 1000).unref()
+
+const enregistrerSuggestionRefusee = async (userId, paysISO, maintenant = new Date()) => {
+  suggestionsRefusees.set(`${userId}:${paysISO}`, maintenant.getTime() + DUREE_REFUS_JOURS * MS_PAR_JOUR)
+  return journaliserAudit({
+    userId,
+    entite: 'PREDICTION',
+    action: `SUGGESTION_REFUSEE_${paysISO}`,
+    acteur: 'USER'
+  })
+}
 
 // ── Traitement principal ────────────────────────────────────
 const predictionPreAtterrissage = async (userId, { paysOrigine = null, maintenant = new Date() } = {}) => {
@@ -125,10 +150,12 @@ const predictionPreAtterrissage = async (userId, { paysOrigine = null, maintenan
   }
 
   const destinationsScorees = scorerDestinations(historique, paysOrigine, maintenant)
-  const meilleure = trouverMeilleureDestination(destinationsScorees)
+  const candidates = destinationsScorees.filter((destination) => !estRefuseeRecemment(userId, destination.pays, maintenant))
+  const meilleure = trouverMeilleureDestination(candidates)
 
   if (!meilleure) {
-    return { suggestion: null, raison: 'AUCUNE_DESTINATION', totalVoyages: historique.length, destinationsScorees }
+    const raison = destinationsScorees.length > 0 ? 'SUGGESTION_REFUSEE_RECEMMENT' : 'AUCUNE_DESTINATION'
+    return { suggestion: null, raison, totalVoyages: historique.length, destinationsScorees }
   }
   if (meilleure.probabilite < SEUIL_SUGGESTION) {
     return { suggestion: null, raison: 'PROBABILITE_INSUFFISANTE', meilleure, totalVoyages: historique.length, destinationsScorees }
@@ -149,5 +176,7 @@ module.exports = {
   scorerDestinations,
   recupererHistoriqueVoyage,
   enregistrerSuggestionRefusee,
+  estRefuseeRecemment,
+  reinitialiserSuggestionsRefusees: () => suggestionsRefusees.clear(),
   predictionPreAtterrissage
 }

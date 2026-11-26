@@ -10,7 +10,8 @@
 //   2. Sinon, réservation ATOMIQUE du rang suivant dans un pool actif
 //      (compare-and-swap sur allocated_count : deux requêtes simultanées
 //      ne peuvent jamais obtenir le même numéro), puis création du numéro.
-//   3. Alerte de réapprovisionnement à 90 % d'occupation.
+//   3. À 90 % d'occupation : commande de réapprovisionnement lancée
+//      en arrière-plan (algo 19).
 // ════════════════════════════════════════════════════════════
 
 const supabase = require('../supabase')
@@ -18,8 +19,11 @@ const logger = require('../utils/logger')
 const { conflit } = require('../utils/http')
 const { donnees, estViolationUnicite, executerSansEchec, ErreurBase } = require('../utils/db')
 const { decalerNumero, comparerNumeros } = require('../utils/numeros')
+const { JITStockManager } = require('./algo19_jitStockManager')
 
 const SEUIL_REAPPROVISIONNEMENT = 0.90
+const STATUT_COMMANDE_REQUISE = 'REORDER_REQUIRED'
+const STATUT_COMMANDE_EN_COURS = 'REORDER_PENDING'
 const MAX_ESSAIS_RESERVATION = 5
 const STATUTS_CONSERVES = new Set(['ACTIVE', 'AWAITING_ARRIVAL'])
 const STATUT_SUSPENDU = 'SUSPENDED'
@@ -123,14 +127,34 @@ const creerNouveauNumero = (userId, didNumber, paysISO, poolId) => supabase
   .select()
   .single()
 
-const alerterReapprovisionnement = async (pool) => {
-  if (pool.reorder_status === 'REORDER_PENDING') return
-  await executerSansEchec(
-    supabase.from('did_pool').update({ reorder_status: 'REORDER_PENDING' }).eq('pool_id', pool.pool_id),
-    'alerte de réapprovisionnement'
-  )
-  logger.warn('Stock DID critique : réapprovisionnement déclenché', { poolId: pool.pool_id, paysISO: pool.country_iso })
+// Seuil de 90 % franchi : le pool est signalé (REORDER_REQUIRED = commande à
+// passer) puis le JIT Stock Manager (algo 19) passe la commande au partenaire
+// en arrière-plan (marquage atomique REORDER_PENDING : aucune double commande ;
+// en cas d'échec, nouvel essai au prochain passage planifié). La déclaration
+// du voyage n'attend pas la réponse du partenaire.
+const reapprovisionnementsEnCours = new Set()
+
+const declencherReapprovisionnement = async (pool) => {
+  if (pool.reorder_status === STATUT_COMMANDE_EN_COURS) return
+  if (pool.reorder_status !== STATUT_COMMANDE_REQUISE) {
+    await executerSansEchec(
+      supabase
+        .from('did_pool')
+        .update({ reorder_status: STATUT_COMMANDE_REQUISE })
+        .eq('pool_id', pool.pool_id)
+        .or(`reorder_status.is.null,reorder_status.neq.${STATUT_COMMANDE_EN_COURS}`),
+      'signalement du stock critique'
+    )
+  }
+  logger.warn('Stock DID critique : réapprovisionnement lancé', { poolId: pool.pool_id, paysISO: pool.country_iso })
+  const analyse = JITStockManager({ paysISO: pool.country_iso })
+    .catch((erreur) => logger.error('Réapprovisionnement automatique impossible', erreur))
+    .finally(() => reapprovisionnementsEnCours.delete(analyse))
+  reapprovisionnementsEnCours.add(analyse)
 }
+
+// Attend la fin des commandes lancées en arrière-plan (tests, arrêt propre).
+const attendreReapprovisionnements = () => Promise.allSettled(reapprovisionnementsEnCours)
 
 // ── Traitement principal ────────────────────────────────────
 const attribuerNumeroDID = async (userId, paysISO) => {
@@ -152,7 +176,7 @@ const attribuerNumeroDID = async (userId, paysISO) => {
     const { data, error } = await creerNouveauNumero(userId, didNumber, paysISO, reservation.pool.pool_id)
     if (!error) {
       if (calculerTauxOccupation(reservation.pool.allocated_count, reservation.pool.total_numbers) >= SEUIL_REAPPROVISIONNEMENT) {
-        await alerterReapprovisionnement(reservation.pool)
+        await declencherReapprovisionnement(reservation.pool)
       }
       return data
     }
@@ -170,6 +194,8 @@ const attribuerNumeroDID = async (userId, paysISO) => {
 }
 
 module.exports = {
+  STATUT_COMMANDE_REQUISE,
+  attendreReapprovisionnements,
   attribuerNumeroDID,
   calculerProchainNumero,
   calculerTauxOccupation,

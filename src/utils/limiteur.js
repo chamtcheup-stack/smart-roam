@@ -10,7 +10,12 @@ const { tropDeRequetes } = require('./http')
 
 const INTERVALLE_NETTOYAGE_MAX_MS = 60 * 1000
 
+// Toutes les instances (compteurs, verrous) : remise à zéro globale possible
+// (réinitialisation du mode démo, tests).
+const instances = new Set()
+
 const demarrerNettoyage = (instance, intervalleMs) => {
+  instances.add(instance)
   const minuterie = setInterval(() => instance.nettoyer(), Math.min(intervalleMs, INTERVALLE_NETTOYAGE_MAX_MS))
   minuterie.unref()
 }
@@ -192,4 +197,9 @@ const limiterDebit = ({
   return middleware
 }
 
-module.exports = { CompteurFenetre, VerrouTentatives, VerrouProgressif, limiterDebit }
+// Efface compteurs et verrouillages de toutes les instances.
+const reinitialiserLimiteurs = () => {
+  for (const instance of instances) instance.entrees.clear()
+}
+
+module.exports = { CompteurFenetre, VerrouTentatives, VerrouProgressif, limiterDebit, reinitialiserLimiteurs }

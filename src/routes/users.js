@@ -4,6 +4,7 @@ const express = require('express')
 const {
   inscrireUtilisateur,
   getUtilisateur,
+  modifierProfil,
   mettreAJourKYC,
   getMesNumeros,
   supprimerUtilisateur
@@ -35,6 +36,7 @@ router.post('/', limiteurInscription, inscrireUtilisateur) // compatibilité ave
 router.use(authentifier)
 
 router.get('/:userId', exigerProprietaireParam('userId'), getUtilisateur)
+router.put('/:userId', exigerProprietaireParam('userId'), modifierProfil)
 router.get('/:userId/numbers', exigerProprietaireParam('userId'), getMesNumeros)
 // Suppression du compte : confirmation par PIN exigée (jeton sensible).
 router.delete('/:userId', exigerProprietaireParam('userId'), exigerOperationSensible, supprimerUtilisateur)

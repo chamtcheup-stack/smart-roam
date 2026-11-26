@@ -5,7 +5,7 @@
 //
 //   1. Pays supporté (DID activé)            sinon 400
 //   2. Dates cohérentes (départ ≥ hier, retour ≥ départ, ≤ 1 an)
-//   3. Déclaration déjà en attente → renvoyée telle quelle (idempotence)
+//   3. Voyage vers ce pays déjà déclaré ou en cours → renvoyé tel quel
 //   4. Numéro virtuel attribué (algo 15)     sinon 503
 //   5. Déclaration + historique de voyage enregistrés
 // ════════════════════════════════════════════════════════════
@@ -43,6 +43,7 @@ const verifierPaysSupporte = async (paysISO) => donnees(
   'vérification du pays'
 )
 
+// Voyage vers ce pays déjà déclaré (PENDING) ou en cours (CONFIRMED : voyageur sur place).
 const verifierDeclarationExistante = async (userId, paysISO) => {
   const lignes = donnees(
     await supabase
@@ -50,7 +51,7 @@ const verifierDeclarationExistante = async (userId, paysISO) => {
       .select('*')
       .eq('user_id', userId)
       .eq('destination_country', paysISO)
-      .eq('status', 'PENDING')
+      .in('status', ['PENDING', 'CONFIRMED'])
       .order('declaration_time', { ascending: false })
       .limit(1),
     'recherche d\'une déclaration existante'

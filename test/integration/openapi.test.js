@@ -10,7 +10,7 @@ const path = require('path')
 const { preparer, RACINE } = require('../helpers/contexte')
 
 const { requerir } = preparer()
-const { MONTAGES } = requerir('src/app')
+const { MONTAGES, MONTAGE_DEMO } = requerir('src/app')
 
 const ROUTES_APPLICATION = ['GET /', 'GET /api/health', 'GET /api/ready', 'GET /api/docs/openapi.yaml']
 
@@ -22,7 +22,8 @@ const routesExpress = () => {
     const [methode, chemin] = r.split(' ')
     return `${methode} ${normaliser(chemin)}`
   }))
-  for (const [prefixe, module] of MONTAGES) {
+  // Routes du mode démo comprises : documentées (tag Démo) même si montées seulement en démo.
+  for (const [prefixe, module] of [...MONTAGES, MONTAGE_DEMO]) {
     const routeur = requerir(path.join('src', module))
     for (const couche of routeur.stack) {
       if (!couche.route) continue // middlewares (authentifier…)

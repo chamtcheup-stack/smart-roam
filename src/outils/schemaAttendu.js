@@ -131,7 +131,10 @@ const SCHEMA_ATTENDU = Object.freeze([
   {
     table: 'session',
     optionnelle: 'sessions conservées en mémoire : tous les utilisateurs sont déconnectés à chaque redémarrage',
-    colonnes: { user_id: true, device_id: true, access_token_hash: true, refresh_token_hash: true, expires_at: true }
+    colonnes: {
+      user_id: true, device_id: true, access_token_hash: true, refresh_token_hash: true, expires_at: true,
+      session_id: "déconnexion sans refresh token : la session reste renouvelable jusqu'à son expiration"
+    }
   },
   {
     table: 'device',

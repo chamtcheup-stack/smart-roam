@@ -212,5 +212,6 @@ module.exports = {
   getRegles,
   modifierRegle,
   evaluerAppel,
-  supprimerRegle
+  supprimerRegle,
+  lireStatutLigne
 }

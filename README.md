@@ -2,7 +2,7 @@
 
 API REST (Node.js / Express 5 / Supabase) de **Smart Roam** : numéros virtuels par pays, activation automatique à l'arrivée, renvoi d'appels, eSIM locales, conversion de devises Orange Money, profil miroir et souveraineté des données.
 
-> Le frontend (`mon-app/`) est un projet Vite séparé, non couvert par ce document.
+> L'application mobile (Expo, Android / iOS / web) est dans [`mobile/`](mobile/README.md). L'ancien projet Vite `mon-app/` n'est plus utilisé par l'application mobile.
 
 ---
 
@@ -15,11 +15,56 @@ npm install
 cp .env.example .env        # puis renseigner SUPABASE_URL, SUPABASE_KEY, JWT_SECRET…
 npm run dev                 # rechargement automatique (node --watch)
 npm start                   # production
-npm test                    # 175 tests, sans réseau ni base réelle
+npm test                    # 205 tests, sans réseau ni base réelle
 npm run verifier:schema     # compare votre base Supabase au schéma attendu (lecture seule)
+npm run demo                # démonstration commentée (données fictives, aucune base)
+npm run demo:serveur        # API de démonstration pour l'application mobile
 ```
 
 Vérification : `GET http://localhost:3000/api/health` (processus) et `GET /api/ready` (base joignable).
+
+---
+
+## Mode démo
+
+Pour **montrer le fonctionnement sans base ni opérateur réels** : l'API complète tourne sur des données fictives en mémoire.
+
+| Commande | Usage |
+|---|---|
+| `npm run demo` | Joue un scénario commenté de 18 étapes dans le terminal (`--pause` : attend « Entrée » entre les étapes). |
+| `npm run demo:serveur` | Lance l'API de démonstration (port 3000) et affiche l'adresse à saisir dans l'application mobile. |
+| `npm run demo -- --url http://localhost:3000` | Joue le scénario sur un serveur déjà lancé, pendant que l'application mobile est ouverte. |
+
+Le scénario suit trois personnages fictifs :
+
+- **Awa** est prévenue de son voyage à Paris, qui est prédit. Elle déclare le voyage, configure ses renvois et son profil miroir. Son escale à Casablanca est ignorée. À l'atterrissage à CDG, son numéro s'active et une eSIM est installée. Elle reçoit des appels, change des FCFA en euros avec confirmation par PIN, puis rentre à Douala, et son numéro passe en parking.
+- **Moussa** se fait voler son téléphone : la tentative de fraude est bloquée et sa ligne suspendue. Le support la rétablit.
+- **Le support Orange** voit le stock de numéros français s'épuiser : la commande et la livraison sont automatiques.
+
+| Compte | Téléphone | PIN | Rôle |
+|---|---|---|---|
+| Awa Ngono (Cameroun) | `+237690000001` | `2580` | utilisateur |
+| Moussa Diop (Sénégal) | `+221770000002` | `3691` | utilisateur |
+| Support Orange (démo) | `+237690000099` | `1470` | administrateur |
+
+**Outils de simulation** (`/api/demo`, présents uniquement en démo) :
+
+- signaux réseau d'un pays (`GET /api/demo/signaux/FR`), à renvoyer tels quels à `/api/geolocalisation/arrivee` ;
+- appel entrant (`POST /api/demo/appel-entrant`) ;
+- maintenance immédiate ;
+- état global ;
+- remise à zéro (`POST /api/demo/reinitialiser`, qui oblige chaque appareil à se reconnecter).
+
+Les codes SMS sont renvoyés dans la réponse (`codeDemo`).
+
+Garanties :
+
+- `DEMO_MODE=true` est **refusé si `NODE_ENV=production`** ;
+- aucune connexion à Supabase, même si `SUPABASE_URL` est renseignée ;
+- aucun appel sortant ;
+- chaque réponse porte l'en-tête `X-Smart-Roam-Mode: demo`.
+
+Les numéros français utilisent la plage 06 39 98 xx xx, que l'ARCEP réserve aux œuvres de fiction.
 
 ---
 
@@ -32,7 +77,10 @@ Vérification : `GET http://localhost:3000/api/health` (processus) et `GET /api/
 | `PIN_PEPPER` | recommandé | Poivre secret ajouté au hachage des PIN. |
 | `SERVICE_API_KEY` | non | Clé des appels machine-à-machine (en-tête `x-api-key`), ex. plateforme SIP. |
 | `ADMIN_USER_IDS` | non | `user_id` des administrateurs (séparés par des virgules). |
-| `CORS_ORIGINS` | non | Origines navigateur autorisées. Vide en dev = `http://localhost:5173`. |
+| `CORS_ORIGINS` | non | Origines navigateur autorisées. Vide en dev = Vite (`localhost:5173`) et Expo web (`localhost:8081`). |
+| `OTP_PROVIDER` | **oui en production** | Fournisseur des codes SMS : `aucun` (défaut en production : inscription impossible tant qu'un fournisseur réel n'est pas branché), `console` (développement), `demo` (mode démo). |
+| `OTP_REQUIRED` | non | Code SMS exigé à l'inscription (`true` par défaut en production et en démo). |
+| `DEMO_MODE` | non | `true` : mode démo (données fictives en mémoire). Refusé en production. |
 | `TRUST_PROXY` | derrière un proxy | `1`, `loopback`… pour que l'IP réelle du client soit utilisée (WAF, limitations). |
 | `ENCRYPTION_KEYS` | si chiffrement utilisé | Trousseau AES-256-GCM `v1:<64 hex>[:AAAA-MM-JJ],v2:…` (dernière = courante). |
 | `PARTNER_TLS_PINS`, `PARTNER_TLS_PINS_EXPIRES_AT` | non | Empreintes SPKI SHA-256 des partenaires (certificate pinning). |
@@ -58,6 +106,7 @@ src/algorithms/            règles métier (algos 01 à 20), indépendantes d'Ex
 src/middlewares/           auth (JWT / clé de service), erreurs JSON, sécurité, idempotence
 src/utils/                 validation, accès base, journalisation sans PII, audit, limiteurs
 src/taches/                tâches planifiées : JIT Stock Manager, maintenance
+src/demo/                  mode démo : base en mémoire, données fictives, simulateurs, scénario
 src/outils/                schéma attendu et vérification du schéma réel
 scripts/verifier-schema.js commande « npm run verifier:schema »
 docs/openapi.yaml          spécification OpenAPI 3.1 (servie hors production sur /api/docs/openapi.yaml)
@@ -88,12 +137,14 @@ test/                      tests unitaires et d'intégration (node:test, Supabas
 
 ## Authentification et autorisations
 
-1. **Inscription** `POST /api/users/register` → renvoie des jetons.
-2. **Premier PIN** `POST /api/security/pin/create` (avec ces jetons).
-3. **Connexion** `POST /api/auth/login` `{ phoneNumber, pin, deviceId? }` → `access_token` (15 min) + `refresh_token` (7 jours).
-4. Appels : en-tête `Authorization: Bearer <access_token>`.
-5. **Renouvellement** `POST /api/auth/refresh` : le refresh token est à usage unique ; sa réutilisation révoque toutes les sessions.
-6. **Déconnexion** `POST /api/auth/logout` (session) ou `/logout-all` (toutes).
+1. **Code SMS** `POST /api/auth/otp` `{ phoneNumber, motif: "INSCRIPTION" }`. Ce code prouve que l'utilisateur possède le numéro. Il comporte 6 chiffres, reste valable 5 minutes et accepte 5 essais au plus. Un même numéro reçoit au plus 1 code par minute et 5 par heure.
+2. **Inscription** `POST /api/users/register` `{ phoneNumber, countryResidence, otpCode }` → renvoie des jetons.
+3. **Premier PIN** `POST /api/security/pin/create` (avec ces jetons).
+4. **Connexion** `POST /api/auth/login` `{ phoneNumber, pin, deviceId? }` → `access_token` (15 min) + `refresh_token` (7 jours). La réponse indique aussi le `role` et le `display_name`.
+5. Appels : en-tête `Authorization: Bearer <access_token>`.
+6. **Renouvellement** `POST /api/auth/refresh` : le refresh token est à usage unique ; sa réutilisation révoque toutes les sessions.
+7. **Déconnexion** `POST /api/auth/logout` (la session et son refresh token sont fermés, même sans le refresh token) ou `/logout-all` (toutes).
+8. **PIN oublié** : `POST /api/auth/otp` (motif `PIN_OUBLIE`), puis `POST /api/auth/pin-oublie` `{ phoneNumber, otpCode, nouveauPin }`. Toutes les sessions sont fermées.
 
 | Rôle | Obtention | Droits |
 |---|---|---|
@@ -125,15 +176,20 @@ Spécification complète : [`docs/openapi.yaml`](docs/openapi.yaml). Un test vé
 | Méthode | Chemin | Accès | Description |
 |---|---|---|---|
 | GET | `/api/health`, `/api/ready` | 🌐 | Supervision (processus / base) |
+| GET | `/api/pays` | 🌐 | Pays référencés (résidence, destinations avec numéro disponible) |
+| POST | `/api/auth/otp` | 🌐 | Code de vérification par SMS (inscription, PIN oublié) |
 | POST | `/api/auth/login`, `/api/auth/refresh` | 🌐 | Connexion, renouvellement des jetons |
+| POST | `/api/auth/pin-oublie` | 🌐 | Nouveau PIN après code SMS |
 | POST | `/api/auth/logout`, `/api/auth/logout-all` | 👤 | Déconnexion |
-| POST | `/api/users/register` | 🌐 | Inscription |
-| GET / DELETE | `/api/users/:userId` | 👤 / 👤 🔐 | Profil (liste blanche de champs) / suppression logique |
+| POST | `/api/users/register` | 🌐 | Inscription (code SMS exigé en production) |
+| GET / PUT / DELETE | `/api/users/:userId` | 👤 / 👤 / 👤 🔐 | Profil et rôle / nom affiché (profils miroir resynchronisés) / suppression logique |
 | GET | `/api/users/:userId/numbers` | 👤 | Numéros virtuels (paginé) |
 | PUT | `/api/users/:userId/kyc` | 🛡️ | Statut KYC |
 | POST | `/api/security/pin/create`, `/pin/verify` | 👤 | PIN : création / changement, vérification |
 | POST | `/api/security/pin/unlock` | 🛡️ | Lever le verrouillage anti-force brute d'un compte |
 | POST | `/api/security/waf/analyze` | 🛡️ | Simulation du WAF sur une charge utile |
+| GET | `/api/security/fraud-alerts` | 🛡️ | Alertes de fraude (filtre `?userId=`) |
+| PUT | `/api/security/numbers/:numberId/reactivate` | 🛡️ | Lever la suspension anti-fraude d'un numéro |
 | POST | `/api/declarations/new` | 👤 🔑 | Déclarer un voyage (attribue le numéro) |
 | GET | `/api/declarations/:userId` | 👤 | Déclarations (paginé) |
 | PUT | `/api/declarations/:declarationId/cancel` | 👤 | Annuler (numéro mis en parking) |
@@ -151,11 +207,13 @@ Spécification complète : [`docs/openapi.yaml`](docs/openapi.yaml). Un test vé
 | GET | `/api/currency/history/:userId` | 👤 | Transactions (paginé) |
 | POST | `/api/mirror/sync`, `/api/mirror/consent` | 👤 | Profil miroir, consentements |
 | GET | `/api/mirror/:userId` | 👤 | Profils miroir (paginé) |
+| GET | `/api/mirror/consents/:userId` | 👤 | Consentements, avec leur état (accordé / refusé / expiré) |
 | POST | `/api/prediction/suggest`, `/feedback` | 👤 | Destination suggérée, réponse de l'utilisateur |
 | GET | `/api/prediction/history/:userId` | 👤 | Historique de voyages (paginé) |
 | GET | `/api/stock/pools` | 🛡️ | État des pools DID (paginé) |
 | POST | `/api/stock/check`, `/api/stock/jit/run` | 🛡️ | Analyse JIT d'un pays / de tous les pools |
 | PUT | `/api/stock/reorder/:poolId` | 🛡️ | Confirmer un réapprovisionnement |
+| GET / POST | `/api/demo/…` | 🌐 / 👤 | **Mode démo uniquement** : comptes, signaux simulés, appel entrant, maintenance, état, remise à zéro |
 
 ---
 
@@ -190,6 +248,8 @@ Spécification complète : [`docs/openapi.yaml`](docs/openapi.yaml). Un test vé
   - les sessions expirées sont purgées.
 
   Toutes ces mises à jour sont conditionnelles : elles n'écrasent jamais une arrivée détectée entre-temps.
+- **Réapprovisionnement** : dès qu'un pool de numéros atteint 90 %, il est marqué `REORDER_REQUIRED`. La commande est ensuite passée au partenaire en arrière-plan : le pool passe `REORDER_PENDING`, sans risque de double commande. En cas d'échec, le JIT planifié retente.
+- **Fraude avérée** : le numéro est suspendu et **toutes les sessions du compte sont fermées** (un téléphone volé est déconnecté). Le support consulte l'alerte et lève la suspension par l'API.
 - **Concurrence** : les conversions, déclarations et provisionings eSIM d'un même utilisateur sont exécutés l'un après l'autre (contrôle anti-fraude non contournable par des requêtes simultanées).
 - **Base lente** : chaque requête Supabase a un délai maximal (`SUPABASE_TIMEOUT_MS`), sans nouvelles tentatives qui cumuleraient les délais.
 - **Journaux** : identifiant de requête sur chaque ligne, journal d'accès (méthode, chemin, statut, durée), format JSON optionnel (`LOG_FORMAT=json`).
@@ -233,11 +293,11 @@ Le backend s'adapte au schéma réel : une colonne optionnelle absente est simpl
 
 | Sujet | État actuel | À prévoir |
 |---|---|---|
-| Vérification du numéro à l'inscription | aucune (KYC `PENDING`) | OTP par SMS avant la délivrance des jetons |
+| Envoi des SMS (codes OTP) | mécanisme complet ; **aucun fournisseur réel** (`OTP_PROVIDER=aucun` en production) | brancher l'API SMS (ex. Orange) dans `src/utils/otp.js` |
 | SM-DP+ (eSIM) et commandes aux partenaires MVNO | **simulés** (avertissement journalisé) | intégrations GSMA ES2+ et API partenaires (avec `creerAgentHttpsEpingle`) |
 | Notifications utilisateur (fraude, voyage) | journalisées | push / SMS |
 | Pays de l'adresse IP | fourni par le client (`paysIP`) | GeoIP côté serveur |
-| Limiteurs, verrous, WAF, idempotence, révocations, exclusion par utilisateur | en mémoire (un processus) | magasin partagé (Redis) en multi-instances |
+| Limiteurs, verrous, WAF, idempotence, révocations, codes OTP, suggestions refusées, exclusion par utilisateur | en mémoire (un processus) | magasin partagé (Redis) en multi-instances |
 | Conversion de devises | enregistrée en base, **aucun débit Orange Money** | API Orange Money (débit, solde) |
 | Opérations en plusieurs étapes | sans transaction SQL (états partiels possibles en cas de panne) | fonctions PostgreSQL appelées par RPC |
 | Suppression de compte | logique (`deleted_at`) | politique de conservation / anonymisation RGPD |
@@ -251,6 +311,12 @@ Le backend s'adapte au schéma réel : une colonne optionnelle absente est simpl
 npm test
 ```
 
-Tests unitaires (utilitaires et 20 algorithmes) et d'intégration HTTP (socle, authentification, parcours métier), exécutés contre une base Supabase **simulée en mémoire** (`test/helpers/fauxSupabase.js`). Aucun accès réseau ni écriture dans la vraie base, et le fichier `.env` n'est jamais lu en test.
+La suite comprend :
+
+- des tests unitaires (utilitaires et 20 algorithmes) ;
+- des tests d'intégration HTTP : socle, authentification, parcours métier, reproduction du schéma réel ;
+- le mode démo : scénario complet joué deux fois, outils de simulation, OTP, garde-fous.
+
+Tous s'exécutent contre la base **en mémoire** du mode démo (`src/demo/baseMemoire.js`, fidèle aux erreurs de PostgREST). Aucun accès réseau ni écriture dans la vraie base, et le fichier `.env` n'est jamais lu en test.
 
 Le certificat de `test/fixtures/tls/` est un certificat autosigné `localhost`, réservé aux tests du certificate pinning.

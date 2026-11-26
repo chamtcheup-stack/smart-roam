@@ -1,10 +1,14 @@
 'use strict'
 
 const supabase = require('../supabase')
+const config = require('../config')
 const v = require('../utils/validation')
-const { requeteInvalide, introuvable, conflit } = require('../utils/http')
+const logger = require('../utils/logger')
+const { exigerCodeValide } = require('../utils/otp')
+const { requeteInvalide, introuvable, conflit, indisponible } = require('../utils/http')
 const {
   donnees,
+  estColonneAbsente,
   estViolationUnicite,
   executerSansEchec,
   insererAvecColonnesOptionnelles,
@@ -14,6 +18,7 @@ const {
 const { auditerRequete } = require('../utils/audit')
 const { genererTokens, determinerRole, revoquerTousTokens } = require('../algorithms/algo10_zeroTrustJWT')
 const { resoudreRegionCloud } = require('../algorithms/algo14_cloisonnementSouverainete')
+const { synchroniserProfilMiroir } = require('../algorithms/algo18_synchronisationMiroir')
 
 const STATUTS_KYC = ['PENDING', 'VERIFIED', 'REJECTED']
 
@@ -44,6 +49,14 @@ const inscrireUtilisateur = async (req, res) => {
   const telephone = v.telephone(req.body.phoneNumber, 'phoneNumber')
   const paysResidence = v.paysISO(req.body.countryResidence, 'countryResidence')
   const planId = v.identifiant(req.body.planId, 'planId', { optionnel: true }) || null
+  // Preuve de possession du numéro : code SMS (POST /api/auth/otp, motif INSCRIPTION).
+  const codeOtp = v.chaine(req.body.otpCode, 'otpCode', { optionnel: true, min: 4, max: 10 }) || null
+  if (config.otp.obligatoire && !codeOtp) {
+    throw requeteInvalide('Code de vérification SMS requis : demandez-le avec POST /api/auth/otp (motif INSCRIPTION)', {
+      champ: 'otpCode',
+      code: 'OTP_REQUIS'
+    })
+  }
 
   // Le numéro peut être stocké avec ou sans « + » : les deux variantes sont vérifiées.
   const existants = donnees(
@@ -57,6 +70,9 @@ const inscrireUtilisateur = async (req, res) => {
     'lecture du pays de résidence'
   )
   if (!pays) throw requeteInvalide(`Pays introuvable : ${paysResidence}`, { champ: 'countryResidence' })
+
+  // Code consommé seulement une fois les autres contrôles passés.
+  if (codeOtp) exigerCodeValide(telephone, 'INSCRIPTION', codeOtp)
 
   // Colonnes descriptives optionnelles : ignorées si absentes du schéma réel
   // (ex. user_origin_type), sans empêcher l'inscription.
@@ -101,7 +117,9 @@ const inscrireUtilisateur = async (req, res) => {
       user_id: user.user_id,
       phone_number: user.phone_number,
       country_of_residence: user.country_of_residence,
-      kyc_status: user.kyc_status
+      kyc_status: user.kyc_status,
+      display_name: user.display_name || null,
+      role: determinerRole(user)
     },
     tokens
   })
@@ -116,7 +134,53 @@ const getUtilisateur = async (req, res) => {
 
   return res.status(200).json({
     message: 'Utilisateur trouvé',
-    user: profilPublic(utilisateur)
+    user: { ...profilPublic(utilisateur), role: determinerRole(utilisateur) }
+  })
+}
+
+// ════════════════════════════════════════════
+// PUT /api/users/:userId
+// Nom affiché (profil miroir) : { displayName }. Les profils miroir déjà
+// publiés sont resynchronisés (consentements respectés).
+// ════════════════════════════════════════════
+const REGEX_NOM_AFFICHE = /^\p{L}[\p{L}\p{M}' .-]*$/u
+
+const modifierProfil = async (req, res) => {
+  const { userId } = req.params
+  const displayName = v.chaine(req.body.displayName, 'displayName', { min: 2, max: 60 })
+  if (!REGEX_NOM_AFFICHE.test(displayName)) {
+    throw requeteInvalide('displayName : lettres, espaces, apostrophes, points et tirets uniquement', { champ: 'displayName' })
+  }
+  if (!(await chargerUtilisateurActif(userId))) throw introuvable('Utilisateur introuvable')
+
+  const { data: utilisateur, error } = await supabase
+    .from('users')
+    .update({ display_name: displayName })
+    .eq('user_id', userId)
+    .select()
+    .single()
+  if (error) {
+    if (estColonneAbsente(error)) throw indisponible('Nom affiché non pris en charge par la base actuelle (colonne users.display_name absente)')
+    throw new ErreurBase('mise à jour du profil', error)
+  }
+
+  const numeros = donnees(
+    await supabase.from('virtual_number').select('number_id').eq('user_id', userId).not('mirror_display_name', 'is', null),
+    'lecture des profils miroir'
+  ) || []
+  for (const { number_id: numberId } of numeros) {
+    try {
+      await synchroniserProfilMiroir(userId, numberId)
+    } catch (erreur) {
+      logger.warn('Resynchronisation du profil miroir impossible', erreur)
+    }
+  }
+
+  void auditerRequete(req, { userId, entite: 'USER', action: 'PROFIL_MODIFIE' })
+  return res.status(200).json({
+    message: 'Profil mis à jour',
+    user: { ...profilPublic(utilisateur), role: determinerRole(utilisateur) },
+    profilsMiroirSynchronises: numeros.length
   })
 }
 
@@ -201,6 +265,7 @@ const supprimerUtilisateur = async (req, res) => {
 module.exports = {
   inscrireUtilisateur,
   getUtilisateur,
+  modifierProfil,
   mettreAJourKYC,
   getMesNumeros,
   supprimerUtilisateur,

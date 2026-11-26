@@ -16,6 +16,7 @@ const MESSAGES_DECISION = {
   ARRIVEE_CONFIRMEE: 'Arrivée confirmée : votre numéro virtuel est actif',
   RETOUR_DETECTE: 'Retour détecté : vos numéros passent en mode parking',
   DEJA_SUR_PLACE: 'Vous êtes déjà sur place',
+  PAS_ENCORE_PARTI: 'Vous êtes encore dans votre pays : le numéro sera activé à votre arrivée',
   ATTENTE_SIGNAL_SUPPLEMENTAIRE: 'Confiance intermédiaire : renvoyez vos signaux dans quelques secondes',
   ESCALE_IGNOREE: 'Pays sans rapport avec le voyage (escale probable)',
   SCORE_INSUFFISANT: 'Signaux insuffisants pour décider'

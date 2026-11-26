@@ -161,11 +161,20 @@ describe('change de devises', () => {
     assert.equal((await app.appel('POST', '/api/currency/confirm', { jeton: jetonSensible, entetes, corps: { ...demande, montant: 200000 } })).statut, 422)
   })
 
-  test('anti-fraude : montant anormal bloqué, aucune transaction créée', async () => {
+  test('anti-fraude : montant anormal bloqué, aucune transaction créée, sessions fermées', async () => {
     faux.tables.fraud_profile[0].avg_transaction_amount = 1000
     const bloquee = await app.appel('POST', '/api/currency/confirm', { jeton: jetonSensible, corps: { ...demande, montant: 900000 } })
     assert.equal(bloquee.statut, 403)
     assert.equal(faux.tables.currency_transaction.length, 1)
+    // Compte peut-être compromis : les jetons existants sont révoqués.
+    const apres = await app.appel('GET', `/api/users/${U}`, { jeton })
+    assert.deepEqual([apres.statut, apres.json.code], [401, 'TOKENS_REVOQUES'])
+    // Le titulaire se reconnecte (nouveaux jetons) ; le support lève la suspension (simulé ici).
+    faux.tables.fraud_profile[0].avg_transaction_amount = 100000
+    jeton = (await genererTokens({ userId: U, role: 'USER' })).access_token
+    for (const numero of faux.tables.virtual_number) {
+      if (numero.status === 'SUSPENDED') Object.assign(numero, { status: 'ACTIVE', suspended_at: null })
+    }
   })
 
   test('historique paginé et corridors', async () => {

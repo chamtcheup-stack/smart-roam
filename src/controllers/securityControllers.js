@@ -3,8 +3,8 @@
 const supabase = require('../supabase')
 const v = require('../utils/validation')
 const logger = require('../utils/logger')
-const { introuvable, requeteInvalide, interdit, tropDeRequetes } = require('../utils/http')
-const { donnees } = require('../utils/db')
+const { introuvable, requeteInvalide, interdit, conflit, tropDeRequetes } = require('../utils/http')
+const { donnees, estTableAbsente, estColonneAbsente, ErreurBase } = require('../utils/db')
 const { verrouCompte, cleCompte, cleTelephone } = require('../utils/verrouCompte')
 const { auditerRequete } = require('../utils/audit')
 const { estPrivilegie } = require('../middlewares/auth')
@@ -176,9 +176,88 @@ const analyserRequeteWAF = async (req, res) => {
   })
 }
 
+// ════════════════════════════════════════════
+// GET /api/security/fraud-alerts?userId=   (ADMIN / SERVICE)
+// Alertes de fraude, les plus récentes d'abord. Table optionnelle :
+// liste vide (disponible: false) si elle n'existe pas.
+// ════════════════════════════════════════════
+const listerAlertesFraude = async (req, res) => {
+  const page = v.pagination(req.query)
+  const userId = v.identifiant(req.query.userId, 'userId', { optionnel: true })
+
+  const lire = (trierParDate) => {
+    let requete = supabase.from('fraud_alert').select('*', { count: 'exact' })
+    if (userId) requete = requete.eq('user_id', userId)
+    if (trierParDate) requete = requete.order('created_at', { ascending: false })
+    return requete.range(page.offset, page.offset + page.limit - 1)
+  }
+
+  let resultat = await lire(true)
+  if (resultat.error && estColonneAbsente(resultat.error)) resultat = await lire(false) // sans created_at
+  if (resultat.error) {
+    if (estTableAbsente(resultat.error)) return res.status(200).json({ alertes: [], total: 0, ...page, disponible: false })
+    throw new ErreurBase('lecture des alertes de fraude', resultat.error)
+  }
+  const alertes = resultat.data || []
+  return res.status(200).json({
+    alertes,
+    total: Number.isInteger(resultat.count) ? resultat.count : page.offset + alertes.length,
+    ...page,
+    disponible: true
+  })
+}
+
+// ════════════════════════════════════════════
+// PUT /api/security/numbers/:numberId/reactivate   (ADMIN / SERVICE)
+// Lever la suspension anti-fraude d'un numéro, après vérification de
+// l'identité du titulaire par le support. Statut rétabli selon le voyage :
+// actif sur place, en attente avant l'arrivée, en parking sinon.
+// ════════════════════════════════════════════
+const reactiverNumero = async (req, res) => {
+  const numberId = v.identifiant(req.params.numberId, 'numberId')
+  const numero = donnees(
+    await supabase.from('virtual_number').select('*').eq('number_id', numberId).maybeSingle(),
+    'lecture du numéro virtuel'
+  )
+  if (!numero) throw introuvable('Numéro virtuel introuvable')
+  if (numero.status !== 'SUSPENDED') throw conflit('Ce numéro n\'est pas suspendu', { statut: numero.status })
+
+  const voyages = donnees(
+    await supabase
+      .from('trip_declaration')
+      .select('status')
+      .eq('user_id', numero.user_id)
+      .eq('number_id', numberId)
+      .in('status', ['PENDING', 'CONFIRMED'])
+      .order('declaration_time', { ascending: false })
+      .limit(1),
+    'lecture du voyage en cours'
+  ) || []
+  const voyage = voyages[0]
+  const statut = !voyage ? 'PARKED' : (voyage.status === 'CONFIRMED' ? 'ACTIVE' : 'AWAITING_ARRIVAL')
+
+  // Mise à jour conditionnelle : aucun changement concurrent écrasé.
+  const lignes = donnees(
+    await supabase
+      .from('virtual_number')
+      .update({ status: statut, suspended_at: null })
+      .eq('number_id', numberId)
+      .eq('status', 'SUSPENDED')
+      .select(),
+    'levée de la suspension'
+  ) || []
+  if (lignes.length === 0) throw conflit('Le numéro a été modifié entre-temps : réessayez')
+
+  void auditerRequete(req, { userId: numero.user_id, entite: 'SECURITY', action: `SUSPENSION_LEVEE_${numberId}_${statut}` })
+  logger.info('Suspension anti-fraude levée par le support', { numberId, statut, par: req.auth.role })
+  return res.status(200).json({ message: 'Suspension levée', numero: lignes[0] })
+}
+
 module.exports = {
   creerPIN,
   verifierPIN,
   deverrouillerCompte,
-  analyserRequeteWAF
+  analyserRequeteWAF,
+  listerAlertesFraude,
+  reactiverNumero
 }

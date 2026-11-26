@@ -161,6 +161,19 @@ describe('algo07 — détection de fraude', () => {
     assert.equal((await a07.detectionFraudeIA(U, { montant: 10500, pays: 'FR' })).statut, 'NORMAL')
   })
 
+  test('score statistique : seuls les dépassements comptent (faux positifs évités)', () => {
+    const profil = { avg_transaction_amount: 60000, avg_daily_transactions: 0.1 }
+    assert.equal(a07.calculerScoreML({ montant: 1000 }, profil, 0), 0) // plus petit que d'habitude
+    assert.equal(a07.calculerScoreML({ montant: 100000 }, profil, 0), 27) // première transaction du jour
+    assert.equal(a07.calculerScoreML({ montant: 60000 }, profil, 2), 60) // troisième dans la journée
+  })
+
+  test('pays d\'un voyage déclaré : jamais « inhabituel »', async () => {
+    Object.assign(faux.tables.fraud_profile[0], { avg_transaction_amount: 10000, avg_daily_transactions: 1, typical_countries: ['CM'] })
+    assert.equal((await a07.detectionFraudeIA(U, { montant: 9000, pays: 'JP' })).typeAnomalie, 'LOCATION')
+    assert.equal((await a07.detectionFraudeIA(U, { montant: 9000, pays: 'JP', voyage_declare: true })).statut, 'NORMAL')
+  })
+
   test('fréquence : plus de 20 transactions dans l\'heure', async () => {
     Object.assign(faux.tables.fraud_profile[0], { avg_transaction_amount: 10000, avg_daily_transactions: 30, typical_countries: ['FR'] })
     faux.tables.currency_transaction = Array.from({ length: 21 }, (_, i) => ({ transaction_id: `t${i}`, user_id: U, status: 'CONFIRMED', created_at: new Date().toISOString() }))
@@ -205,11 +218,23 @@ describe('algo15 — attribution des numéros DID', () => {
     assert.equal(faux.tables.did_pool[0].reorder_status, null) // 11 % : sous le seuil de 90 %
   })
 
-  test('alerte de réapprovisionnement au franchissement de 90 %', async () => {
+  test('franchissement de 90 % : la commande est réellement passée au partenaire', async () => {
     faux.tables.did_pool[0].allocated_count = 89
     await a15.attribuerNumeroDID('u90', 'FR')
     assert.equal(faux.tables.did_pool[0].allocated_count, 90)
+    // Commande lancée en arrière-plan par le JIT Stock Manager (algo 19).
+    await a15.attendreReapprovisionnements()
     assert.equal(faux.tables.did_pool[0].reorder_status, 'REORDER_PENDING')
+  })
+
+  test('franchissement de 90 % sans partenaire : pool signalé « commande à passer »', async () => {
+    const partenaires = faux.tables.mvno_partner
+    faux.tables.mvno_partner = []
+    faux.tables.did_pool[0].allocated_count = 89
+    await a15.attribuerNumeroDID('u91', 'FR')
+    await a15.attendreReapprovisionnements()
+    assert.equal(faux.tables.did_pool[0].reorder_status, a15.STATUT_COMMANDE_REQUISE)
+    faux.tables.mvno_partner = partenaires
   })
 
   test('numéro existant en base → rang suivant ; pas d\'activation à la création', async () => {

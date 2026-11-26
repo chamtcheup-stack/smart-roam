@@ -3,8 +3,10 @@
 const supabase = require('../supabase')
 const v = require('../utils/validation')
 const { introuvable, requeteInvalide, conflit } = require('../utils/http')
-const { donnees, paginer, executerSansEchec } = require('../utils/db')
+const logger = require('../utils/logger')
+const { donnees, paginer } = require('../utils/db')
 const { executerEnExclusion } = require('../utils/exclusion')
+const { parquerNumerosLiberes } = require('../taches/maintenance')
 const { declarerDestination: declarer } = require('../algorithms/algo20_declarationDestination')
 
 // ════════════════════════════════════════════
@@ -23,7 +25,9 @@ const declarerDestination = async (req, res) => {
 
   if (resultat.statut === 'EXISTANTE') {
     return res.status(200).json({
-      message: 'Déclaration déjà active pour ce pays',
+      message: resultat.declaration.status === 'CONFIRMED'
+        ? 'Vous êtes déjà en voyage dans ce pays'
+        : 'Déclaration déjà active pour ce pays',
       declaration: resultat.declaration
     })
   }
@@ -82,16 +86,14 @@ const annulerDeclaration = async (req, res) => {
   ) || []
   if (lignes.length === 0) throw conflit('La déclaration a été modifiée entre-temps : réessayez')
 
-  // Le numéro reste la propriété de l'utilisateur mais ne reçoit plus d'appels.
+  // Le numéro reste la propriété de l'utilisateur mais ne reçoit plus d'appels,
+  // sauf s'il sert encore à un autre voyage actif.
   if (existante.number_id) {
-    await executerSansEchec(
-      supabase
-        .from('virtual_number')
-        .update({ status: 'PARKED' })
-        .eq('number_id', existante.number_id)
-        .in('status', ['AWAITING_ARRIVAL', 'ACTIVE']),
-      'mise en parking du numéro après annulation'
-    )
+    try {
+      await parquerNumerosLiberes([existante.number_id])
+    } catch (erreur) {
+      logger.warn('Mise en parking du numéro après annulation impossible', erreur)
+    }
   }
 
   return res.status(200).json({ message: 'Déclaration annulée', declaration: lignes[0] })

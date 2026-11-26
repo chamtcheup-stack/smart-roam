@@ -146,6 +146,7 @@ const executerMaintenance = async ({ maintenant = new Date() } = {}) => {
 module.exports = {
   DELAI_GRACE_RETOUR_JOURS,
   DELAI_MAX_SANS_ARRIVEE_JOURS,
+  parquerNumerosLiberes,
   cloturerVoyagesEchus,
   expirerForfaitsESIM,
   purgerSessionsExpirees,

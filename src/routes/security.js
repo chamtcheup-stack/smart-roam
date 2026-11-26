@@ -5,7 +5,9 @@ const {
   creerPIN,
   verifierPIN,
   deverrouillerCompte,
-  analyserRequeteWAF
+  analyserRequeteWAF,
+  listerAlertesFraude,
+  reactiverNumero
 } = require('../controllers/securityControllers')
 const { authentifier, exigerRole, exigerProprietaireCorps, ROLES } = require('../middlewares/auth')
 const { limiterDebit } = require('../utils/limiteur')
@@ -27,5 +29,8 @@ router.post('/pin/create', limiteurPIN, exigerProprietaireCorps('userId'), creer
 router.post('/pin/verify', limiteurPIN, exigerProprietaireCorps('userId'), verifierPIN)
 router.post('/pin/unlock', exigerRole(ROLES.ADMIN, ROLES.SERVICE), deverrouillerCompte)
 router.post('/waf/analyze', exigerRole(ROLES.ADMIN, ROLES.SERVICE), analyserRequeteWAF)
+// Support : alertes de fraude et levée de suspension d'un numéro.
+router.get('/fraud-alerts', exigerRole(ROLES.ADMIN, ROLES.SERVICE), listerAlertesFraude)
+router.put('/numbers/:numberId/reactivate', exigerRole(ROLES.ADMIN, ROLES.SERVICE), reactiverNumero)
 
 module.exports = router

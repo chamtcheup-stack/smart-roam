@@ -9,6 +9,7 @@ const { auditerRequete } = require('../utils/audit')
 const { executerEnExclusion } = require('../utils/exclusion')
 const { preparerConversion, executerTransaction, etatCircuitBreaker } = require('../algorithms/algo17_conversionDevises')
 const { detectionFraudeIA, apprendreTransaction } = require('../algorithms/algo07_detectionFraude')
+const { revoquerTousTokens } = require('../algorithms/algo10_zeroTrustJWT')
 
 const lireDemande = (corps) => {
   v.exigerChamps(corps, ['deviseSource', 'deviseCible', 'montant'])
@@ -32,7 +33,8 @@ const devisPublic = (devis) => ({
   montantEquivalentXAF: devis.montantEquivalentXAF
 })
 
-// Pays de la transaction : destination du voyage en cours, sinon pays de résidence.
+// Pays de la transaction : destination du voyage confirmé en cours (pays attendu
+// pour l'anti-fraude), sinon pays de résidence.
 const determinerPaysTransaction = async (userId) => {
   const voyages = donnees(
     await supabase
@@ -44,12 +46,12 @@ const determinerPaysTransaction = async (userId) => {
       .limit(1),
     'lecture du voyage en cours'
   ) || []
-  if (voyages[0]) return voyages[0].destination_country
+  if (voyages[0]) return { pays: voyages[0].destination_country, voyageDeclare: true }
   const utilisateur = donnees(
     await supabase.from('users').select('country_of_residence').eq('user_id', userId).maybeSingle(),
     'lecture du pays de résidence'
   )
-  return utilisateur ? utilisateur.country_of_residence : null
+  return { pays: utilisateur ? utilisateur.country_of_residence : null, voyageDeclare: false }
 }
 
 // ════════════════════════════════════════════
@@ -83,17 +85,21 @@ const executerConversion = async (req, userId, demande) => {
   const devis = await preparerConversion(demande)
 
   // Contrôle anti-fraude (algo 07) sur le montant équivalent en XAF.
-  const pays = await determinerPaysTransaction(userId)
+  const { pays, voyageDeclare } = await determinerPaysTransaction(userId)
   const controle = await detectionFraudeIA(userId, {
     montant: devis.montantEquivalentXAF,
     devise: 'XAF',
     pays,
+    voyage_declare: voyageDeclare,
     device_id: req.auth && req.auth.deviceId,
     appareil_connu: req.auth ? req.auth.appareilConnu : null
   })
   if (controle.statut === 'SUSPENDU') {
+    // Compte peut-être utilisé par un tiers (téléphone volé) : toutes ses
+    // sessions sont fermées ; le titulaire se reconnecte avec son PIN.
+    await revoquerTousTokens(userId)
     void auditerRequete(req, { userId, entite: 'CURRENCY', action: `TRANSACTION_BLOQUEE_FRAUDE_${controle.typeAnomalie}` })
-    throw interdit('Transaction bloquée par le contrôle anti-fraude : votre numéro a été suspendu par précaution, contactez le support Orange')
+    throw interdit('Transaction bloquée par le contrôle anti-fraude : votre numéro a été suspendu et vos sessions fermées par précaution, contactez le support Orange')
   }
 
   const transaction = await executerTransaction(userId, devis)

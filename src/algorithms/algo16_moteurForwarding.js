@@ -44,6 +44,7 @@ const CODE_SIP_FORWARD = '302 Moved Temporarily'
 const cacheRegles = new Map() // userId → { regles, expiration }
 
 const invaliderCacheRegles = (userId) => cacheRegles.delete(String(userId))
+const viderCacheRegles = () => cacheRegles.clear()
 
 const lireCacheRegles = (userId) => {
   const entree = cacheRegles.get(String(userId))
@@ -193,5 +194,6 @@ module.exports = {
   filtrerReglesDuNumero,
   choisirRegle,
   invaliderCacheRegles,
+  viderCacheRegles,
   moteurRegleForwarding
 }

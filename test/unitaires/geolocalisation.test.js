@@ -155,4 +155,19 @@ describe('algo01 — fusion multi-signaux', () => {
     faux.tables.trip_declaration = []
     assert.equal((await a01.fusionMultiSignaux(U, signauxFrance)).decision, 'SURVEILLANCE')
   })
+
+  test('voyage déclaré, encore chez soi → attente du départ, sans nouvel essai', async () => {
+    const chezSoi = await a01.fusionMultiSignaux(U, { mccMnc: { paysISO: 'CM', confiance: 100 }, ip: 'CM' })
+    assert.equal(chezSoi.decision, 'PAS_ENCORE_PARTI')
+    assert.equal(chezSoi.reessayerDansSecondes, undefined)
+    // Signaux partiels à domicile (IP + changement d'antenne = 50) : pas de boucle d'attente.
+    const partiel = await a01.fusionMultiSignaux(U, { ip: 'CM', cellId: { changement_detecte: true } })
+    assert.equal(partiel.decision, 'PAS_ENCORE_PARTI')
+    assert.equal(faux.tables.virtual_number[0].status, 'AWAITING_ARRIVAL')
+  })
+
+  test('confiance intermédiaire pour l\'arrivée attendue → nouvel essai demandé', async () => {
+    const resultat = await a01.fusionMultiSignaux(U, { ip: 'FR', cellId: { changement_detecte: true } })
+    assert.deepEqual([resultat.decision, resultat.scoreConfiance, resultat.reessayerDansSecondes], ['ATTENTE_SIGNAL_SUPPLEMENTAIRE', 50, 5])
+  })
 })

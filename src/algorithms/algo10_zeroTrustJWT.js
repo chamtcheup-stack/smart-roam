@@ -20,7 +20,7 @@ const supabase = require('../supabase')
 const config = require('../config')
 const logger = require('../utils/logger')
 const { nonAuthentifie } = require('../utils/http')
-const { ErreurBase, estIncompatibiliteSchema } = require('../utils/db')
+const { ErreurBase, estIncompatibiliteSchema, insererAvecColonnesOptionnelles } = require('../utils/db')
 const { journaliserAudit } = require('../utils/audit')
 
 const {
@@ -42,6 +42,7 @@ const sessionsRevoquees = new Map() // sid → expiration (ms)
 const refreshConsommes = new Map() // hash → { userId, expiration } (détection de réutilisation)
 const sessionsMemoire = new Map() // hash → session (repli si table absente)
 let tableSessionDisponible = true
+let jetonsRevoquesAvant = 0 // révocation globale (réinitialisation du mode démo)
 
 const nettoyerEtat = (maintenant = Date.now()) => {
   const dureeAccesMaxMs = Math.max(dureeAccesMinutes, dureeAccesSensibleMinutes) * MS_PAR_MINUTE
@@ -98,9 +99,11 @@ const basculerEnMemoire = (erreur) => {
   })
 }
 
+// session_id = sid du jeton d'accès : permet de fermer la session (et son refresh
+// token) à la déconnexion, même sans le refresh token. Colonne facultative.
 const enregistrerSession = async (session) => {
   if (tableSessionDisponible) {
-    const { error } = await supabase.from('session').insert(session)
+    const { error } = await insererAvecColonnesOptionnelles(supabase, 'session', session, ['session_id'], { retourner: false })
     if (!error) return
     if (!estIncompatibiliteSchema(error)) throw new ErreurBase('enregistrement de la session', error)
     basculerEnMemoire(error)
@@ -142,6 +145,17 @@ const supprimerSession = async (refreshTokenHash) => {
   return supprimeeMemoire || (Array.isArray(data) && data.length > 0)
 }
 
+// Ferme une session par son identifiant (sid). Sans colonne session_id, la
+// session reste renouvelable jusqu'à son expiration (jeton d'accès révoqué malgré tout).
+const supprimerSessionParIdentifiant = async (sessionId) => {
+  for (const [hash, session] of sessionsMemoire) {
+    if (session.session_id === sessionId) sessionsMemoire.delete(hash)
+  }
+  if (!tableSessionDisponible) return
+  const { error } = await supabase.from('session').delete().eq('session_id', sessionId)
+  if (error && !estIncompatibiliteSchema(error)) throw new ErreurBase('fermeture de la session', error)
+}
+
 const supprimerSessionsUtilisateur = async (userId) => {
   for (const [hash, session] of sessionsMemoire) {
     if (String(session.user_id) === String(userId)) sessionsMemoire.delete(hash)
@@ -163,6 +177,7 @@ const genererTokens = async ({ userId, role = ROLE_USER, deviceId = null, operat
   const expiration = new Date(Date.now() + dureeRefreshMinutes * MS_PAR_MINUTE)
 
   await enregistrerSession({
+    session_id: sessionId,
     user_id: userId,
     device_id: deviceId,
     access_token_hash: hacherToken(accessToken),
@@ -201,7 +216,7 @@ const verifierToken = (tokenRecu) => {
   const revoqueLe = revocationsUtilisateur.get(payload.sub)
   const emisLe = payload.iat_ms || payload.iat * 1000
   // <= : un jeton émis dans la même milliseconde que la révocation est révoqué.
-  if (revoqueLe && emisLe <= revoqueLe) {
+  if ((revoqueLe && emisLe <= revoqueLe) || emisLe <= jetonsRevoquesAvant) {
     throw nonAuthentifie('Jetons révoqués : reconnexion requise', { code: 'TOKENS_REVOQUES' })
   }
 
@@ -237,6 +252,8 @@ const revoquerSession = async ({ refreshToken, sessionId }) => {
     sessionsRevoquees.set(sessionId, Date.now() + Math.max(dureeAccesMinutes, dureeAccesSensibleMinutes) * MS_PAR_MINUTE)
   }
   if (refreshToken) await supprimerSession(hacherToken(refreshToken))
+  // Sans refresh token fourni, la session courante est fermée par son identifiant.
+  if (sessionId) await supprimerSessionParIdentifiant(sessionId)
 }
 
 // chargerUtilisateur(userId) → ligne utilisateur active ou null.
@@ -270,6 +287,17 @@ const renouvelerTokens = async (refreshToken, chargerUtilisateur) => {
   })
 }
 
+// État en mémoire remis à zéro et révocation de TOUS les jetons déjà émis
+// (réinitialisation du mode démo : chaque appareil doit se reconnecter).
+const reinitialiserEtatSessions = () => {
+  jetonsRevoquesAvant = Date.now()
+  revocationsUtilisateur.clear()
+  sessionsRevoquees.clear()
+  refreshConsommes.clear()
+  sessionsMemoire.clear()
+  tableSessionDisponible = true
+}
+
 module.exports = {
   ROLE_ADMIN,
   ROLE_USER,
@@ -282,5 +310,6 @@ module.exports = {
   revoquerSession,
   revoquerTousTokens,
   hacherToken,
-  nettoyerEtat
+  nettoyerEtat,
+  reinitialiserEtatSessions
 }

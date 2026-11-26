@@ -14,7 +14,8 @@ const enPourcentage = (probabilite) => `${(probabilite * 100).toFixed(1)}%`
 const MESSAGES_SANS_SUGGESTION = {
   HISTORIQUE_INSUFFISANT: 'Historique insuffisant pour prédire',
   PROBABILITE_INSUFFISANTE: 'Probabilité insuffisante pour suggérer',
-  AUCUNE_DESTINATION: 'Aucune destination à suggérer'
+  AUCUNE_DESTINATION: 'Aucune destination à suggérer',
+  SUGGESTION_REFUSEE_RECEMMENT: 'Suggestion refusée récemment : elle ne sera pas reproposée avant 7 jours'
 }
 
 // ════════════════════════════════════════════
@@ -100,7 +101,7 @@ const enregistrerRetourSuggestion = async (req, res) => {
   return res.status(200).json({
     message: acceptee
       ? 'Suggestion acceptée : confirmez votre voyage avec POST /api/declarations/new'
-      : 'Suggestion refusée : elle sera prise en compte pour les prochaines prédictions',
+      : 'Suggestion refusée : cette destination ne sera pas reproposée pendant 7 jours',
     paysISO,
     acceptee
   })

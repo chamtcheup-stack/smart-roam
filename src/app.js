@@ -30,9 +30,13 @@ const MONTAGES = Object.freeze([
   ['/api/geolocalisation', './routes/geolocalisation'],
   ['/api/security', './routes/security'],
   ['/api/currency', './routes/currency'],
-  ['/api/declarations', './routes/declarations']
+  ['/api/declarations', './routes/declarations'],
+  ['/api/pays', './routes/pays']
 ])
 const ALIAS = Object.freeze([['/api/geolocation', './routes/geolocalisation']]) // alias documenté dans le contrôleur
+// Mode démo uniquement (DEMO_MODE=true) : simulateurs et données fictives.
+const MONTAGE_DEMO = Object.freeze(['/api/demo', './demo/routesDemo'])
+const MODE = config.demo ? 'demo' : 'reel' // « reel » : base Supabase réelle
 
 const verifierBase = async () => {
   const requete = supabase.from('country').select('country_iso', { head: true, count: 'exact' }).limit(1)
@@ -58,6 +62,13 @@ const creerApp = () => {
   app.disable('x-powered-by')
 
   app.use(enTetesSecurite)
+  // Une réponse de démonstration ne doit jamais être prise pour une donnée réelle.
+  if (config.demo) {
+    app.use((req, res, next) => {
+      res.set('X-Smart-Roam-Mode', 'demo')
+      next()
+    })
+  }
   app.use(cors(optionsCors))
   app.use(assainirReponses)
   app.use(express.json({ limit: '100kb' }))
@@ -73,12 +84,12 @@ const creerApp = () => {
 
   // ── Supervision ──────────────────────────────────────────
   app.get('/', (req, res) => {
-    res.json({ message: 'Serveur Smart Roam opérationnel' })
+    res.json({ message: 'Serveur Smart Roam opérationnel', mode: MODE })
   })
 
   // Liveness : le processus répond.
   app.get('/api/health', (req, res) => {
-    res.json({ statut: 'ok', uptimeSecondes: Math.round(process.uptime()) })
+    res.json({ statut: 'ok', mode: MODE, uptimeSecondes: Math.round(process.uptime()) })
   })
 
   // Readiness : la base de données est joignable.
@@ -99,6 +110,7 @@ const creerApp = () => {
 
   // ── Routes métier ────────────────────────────────────────
   for (const [prefixe, module] of [...MONTAGES, ...ALIAS]) app.use(prefixe, require(module))
+  if (config.demo) app.use(MONTAGE_DEMO[0], require(MONTAGE_DEMO[1]))
 
   app.use(routeIntrouvable)
   app.use(gestionnaireErreurs)
@@ -106,4 +118,4 @@ const creerApp = () => {
   return app
 }
 
-module.exports = { creerApp, MONTAGES }
+module.exports = { creerApp, MONTAGES, MONTAGE_DEMO }
